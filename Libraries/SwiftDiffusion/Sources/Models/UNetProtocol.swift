@@ -2282,6 +2282,8 @@ extension UNetFromNNC {
             let shape = inputs[0].shape
             let audioFrames = inputs[1].shape[1]
             let textLength = inputs[inputs.count - 2].shape[1]
+            // An IC-LoRA guide latent, when present, comes right after the audio.
+            let guideShape: TensorShape? = inputs.count > 2 + 1545 ? inputs[2].shape : nil
             return LoRALTX2(
               time: shape[0], h: shape[1], w: shape[2], textLength: textLength,
               audioFrames: audioFrames, channels: (4096, 2048), layers: 48,
@@ -2289,7 +2291,8 @@ extension UNetFromNNC {
               usesFlashAttention: valueOr(useFlashAttention, .scale1),
               useGatedAttention: true,
               textCrossAttentionAdaLN: true,
-              LoRAConfiguration: configuration
+              LoRAConfiguration: configuration,
+              guide: guideShape.map { (time: $0[0], h: $0[1], w: $0[2]) }
             ).1
           })
       } else {
@@ -2298,13 +2301,16 @@ extension UNetFromNNC {
             let shape = inputs[0].shape
             let audioFrames = inputs[1].shape[1]
             let textLength = inputs[inputs.count - 2].shape[1]
+            // An IC-LoRA guide latent, when present, comes right after the audio.
+            let guideShape: TensorShape? = inputs.count > 2 + 1545 ? inputs[2].shape : nil
             return LTX2(
               time: shape[0], h: shape[1], w: shape[2], textLength: textLength,
               audioFrames: audioFrames, channels: (4096, 2048), layers: 48,
               tokenModulation: tokenModulation, KV: false,
               usesFlashAttention: valueOr(useFlashAttention, .scale1),
               useGatedAttention: true,
-              textCrossAttentionAdaLN: true
+              textCrossAttentionAdaLN: true,
+              guide: guideShape.map { (time: $0[0], h: $0[1], w: $0[2]) }
             ).1
           })
       }
@@ -3878,12 +3884,14 @@ extension UNetFromNNC {
         0..<batchSize, startHeight..<shape[1], 0..<startWidth, 0..<shape[3]
       ].contiguous().reshaped(.HWC(1, audioFrames, shape[3]))
       let restInputs = Array(inputs[(inputs.count - 1545)...])
+      // IC-LoRA guide latent: the second reference, after the first frame.
+      let guideInputs: [DynamicGraph.AnyTensor] = referenceImageCount > 1 ? [inputs[2]] : []
       guard isCfgEnabled else {
-        unet.compile(inputs: [videoInput, audioInput] + restInputs)
+        unet.compile(inputs: [videoInput, audioInput] + guideInputs + restInputs)
         return
       }
       unet.compile(
-        inputs: [videoInput, audioInput]
+        inputs: [videoInput, audioInput] + guideInputs
           + restInputs.enumerated().map {
             guard $0.0 >= 3 + 48 * 32 + 4 else { return $0.1 }
             let shape = $0.1.shape
@@ -5441,6 +5449,9 @@ extension UNetFromNNC {
       return Functional.concat(axis: 0, etUncond, etCond)
     case .ltx2_3:
       let graph = firstInput.graph
+      // IC-LoRA guide latent: the second reference, after the first frame.
+      let ltxGuideInputs: [DynamicGraph.AnyTensor] =
+        referenceImageCount > 1 ? [restInputs[1]] : []
       var shape = firstInput.shape
       if isCfgEnabled {
         shape[0] = shape[0] / 2
@@ -5469,7 +5480,8 @@ extension UNetFromNNC {
               0..<min(startWidth, firstFrameShape[2]), 0..<shape[3]]
         }
         let output = unet(
-          inputs: videoInput, [audioInput] + restInputs[(restInputs.count - 1545)...]
+          inputs: videoInput,
+          [audioInput] + ltxGuideInputs + restInputs[(restInputs.count - 1545)...]
         )
         .map {
           $0.as(of: FloatType.self)
@@ -5518,7 +5530,8 @@ extension UNetFromNNC {
           ].copied()
         }
       }
-      let outputUncond = unet(inputs: videoInputUncond, [audioInputUncond] + restInputsUncond)
+      let outputUncond = unet(
+        inputs: videoInputUncond, [audioInputUncond] + ltxGuideInputs + restInputsUncond)
         .map {
           $0.as(of: FloatType.self)
         }
@@ -5568,7 +5581,8 @@ extension UNetFromNNC {
           ].copied()
         }
       }
-      let outputCond = unet(inputs: videoInputCond, [audioInputCond] + restInputsCond)
+      let outputCond = unet(
+        inputs: videoInputCond, [audioInputCond] + ltxGuideInputs + restInputsCond)
         .map {
           $0.as(of: FloatType.self)
         }

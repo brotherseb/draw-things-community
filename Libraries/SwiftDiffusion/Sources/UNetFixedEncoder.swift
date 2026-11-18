@@ -3760,10 +3760,39 @@ extension UNetFixedEncoder {
         weightsCache.attach("\(filePath):[video_connector]", from: videoConnector.parameters)
         weightsCache.attach("\(filePath):[audio_connector]", from: audioConnector.parameters)
       }
-      let (rotaryEmbedding, rotaryEmbeddingAudio, rotaryEmbeddingVideoToAudio) =
+      var (rotaryEmbedding, rotaryEmbeddingAudio, rotaryEmbeddingVideoToAudio) =
         LTX2VideoAudioRotaryPositionEmbedding(
           time: batchSize, height: h, width: w, audioTime: (batchSize - 1) * 8 + 1,
           channels: (4096, 2048), numberOfHeads: 32)
+      // IC-LoRA guide (second reference, [frames, height, width, 128] on a grid `h / height` times
+      // smaller): its tokens follow the video tokens, so their embeddings follow too.
+      if referenceImages.count > 1 {
+        let guideShape = referenceImages[1].shape
+        let (guideRotary, guideRotaryVideoToAudio) = LTX2GuideRotaryPositionEmbedding(
+          time: guideShape[0], height: guideShape[1], width: guideShape[2],
+          scale: max(1, h / guideShape[1]), channels: (4096, 2048), numberOfHeads: 32)
+        func appendingTokens(_ a: Tensor<Float>, _ b: Tensor<Float>) -> Tensor<Float> {
+          let shape = a.shape
+          var result = Tensor<Float>(
+            .CPU, .NHWC(1, shape[1] + b.shape[1], shape[2], shape[3]))
+          let aCount = shape[1] * shape[2] * shape[3]
+          let bCount = b.shape[1] * b.shape[2] * b.shape[3]
+          result.withUnsafeMutableBytes { buffer in
+            let r = buffer.baseAddress!.assumingMemoryBound(to: Float.self)
+            a.withUnsafeBytes {
+              r.update(from: $0.baseAddress!.assumingMemoryBound(to: Float.self), count: aCount)
+            }
+            b.withUnsafeBytes {
+              (r + aCount).update(
+                from: $0.baseAddress!.assumingMemoryBound(to: Float.self), count: bCount)
+            }
+          }
+          return result
+        }
+        rotaryEmbedding = appendingTokens(rotaryEmbedding, guideRotary)
+        rotaryEmbeddingVideoToAudio = appendingTokens(
+          rotaryEmbeddingVideoToAudio, guideRotaryVideoToAudio)
+      }
       var timesteps = timesteps
       // Need condition on 0 timestep: for the first-frame reference, and for a reference audio
       // (audio-to-video, where the audio stays clean through sampling).

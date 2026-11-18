@@ -578,6 +578,18 @@ struct GenerateImageInputOptions: ParsableArguments {
   var audioStartTime: Double = 0
 
   @Option(
+    name: .customLong("control-video"),
+    help:
+      "LTX-2.3 IC-LoRA guide video (e.g. a pose skeleton), read from its first frame at the clip's frame rate. Load the IC-LoRA itself in --config-json loras. Needs a first-frame --image.")
+  var controlVideo: String?
+
+  @Option(
+    name: .customLong("control-downscale"),
+    help:
+      "Reference downscale factor of the IC-LoRA: the guide is encoded at the first-pass size divided by this (2 for the ...-ref0.5 LoRAs).")
+  var controlDownscale: Int = 2
+
+  @Option(
     name: .customLong("audio-encoder-file"),
     help:
       "Audio encoder checkpoint filename in the models directory (defaults to the model's encoder)."
@@ -4612,6 +4624,32 @@ extension DrawThingsCLI {
       if let audio {
         hints.append((.audio, [(audio as AnyTensor, Float(1))]))
       }
+      if let controlVideoPath = imageInput.controlVideo {
+        guard modelSpecification.version == .ltx2_3, canvasIndex != nil else {
+          throw ValidationError("--control-video needs LTX-2.3 and a first-frame --image.")
+        }
+        let downscale = max(1, imageInput.controlDownscale)
+        let baseWidth =
+          Int(configuration.hiresFix ? configuration.hiresFixStartWidth : configuration.startWidth)
+          * 64
+        let baseHeight =
+          Int(
+            configuration.hiresFix ? configuration.hiresFixStartHeight : configuration.startHeight)
+          * 64
+        guard baseWidth % (32 * downscale) == 0, baseHeight % (32 * downscale) == 0 else {
+          throw ValidationError(
+            "The first-pass size must be a multiple of \(32 * downscale) for --control-downscale \(downscale).")
+        }
+        let frames = max(Int(configuration.numFrames), 1)
+        let guide = try loadControlVideoTensor(
+          path: controlVideoPath, frames: frames,
+          framesPerSecond: ModelZoo.framesPerSecondForModel(configuration.model ?? ""),
+          width: baseWidth / downscale, height: baseHeight / downscale)
+        context.print(
+          "Control video: \(controlVideoPath) (\(frames) frames at \(baseWidth / downscale)x\(baseHeight / downscale))"
+        )
+        hints.append((.pose, [(guide as AnyTensor, Float(1))]))
+      }
       context.print("Models directory: \(modelsDirectory.path)")
       let result = try runner.generate(
         prompt: promptValues.prompt, negativePrompt: resolvedNegativePrompt,
@@ -5358,6 +5396,59 @@ private func validateVideoOutputOptions(outputPath: String, videoFormat: VideoEx
   default:
     return
   }
+}
+
+/// Reads `frames` frames of a video at `framesPerSecond`, from its start, scaled to
+/// `width` x `height`, as a [frames, height, width, 3] tensor in [-1, 1]. Frames past the end of
+/// the video repeat the last one.
+private func loadControlVideoTensor(
+  path: String, frames: Int, framesPerSecond: Double, width: Int, height: Int
+) throws -> Tensor<FloatType> {
+  #if canImport(AVFoundation) && canImport(CoreMedia) && canImport(CoreVideo)
+    let url = URL(fileURLWithPath: path).standardizedFileURL
+    guard FileManager.default.fileExists(atPath: url.path) else {
+      throw ValidationError("Control video not found: \(url.path)")
+    }
+    let asset = AVURLAsset(url: url)
+    let generator = AVAssetImageGenerator(asset: asset)
+    generator.appliesPreferredTrackTransform = true
+    generator.requestedTimeToleranceBefore = .zero
+    generator.requestedTimeToleranceAfter = .zero
+    var tensor = Tensor<FloatType>(.CPU, .NHWC(frames, height, width, 3))
+    var pixels = [UInt8](repeating: 0, count: width * height * 4)
+    var lastImage: CGImage? = nil
+    let colorSpace = CGColorSpaceCreateDeviceRGB()
+    for i in 0..<frames {
+      // Middle of frame i, so rounding never lands on the previous frame.
+      let time = CMTime(seconds: (Double(i) + 0.5) / framesPerSecond, preferredTimescale: 600_000)
+      let image = (try? generator.copyCGImage(at: time, actualTime: nil)) ?? lastImage
+      guard let image else {
+        throw ValidationError("Could not read frame \(i) of \(url.path).")
+      }
+      lastImage = image
+      guard
+        let context = CGContext(
+          data: &pixels, width: width, height: height, bitsPerComponent: 8,
+          bytesPerRow: width * 4, space: colorSpace,
+          bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)
+      else {
+        throw ValidationError("Could not convert frame \(i) of \(url.path).")
+      }
+      context.interpolationQuality = .high
+      context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+      for y in 0..<height {
+        for x in 0..<width {
+          let offset = (y * width + x) * 4
+          for c in 0..<3 {
+            tensor[i, y, x, c] = FloatType(Float(pixels[offset + c]) / 127.5 - 1)
+          }
+        }
+      }
+    }
+    return tensor
+  #else
+    throw ValidationError("--control-video needs AVFoundation.")
+  #endif
 }
 
 private func loadInputImageTensor(

@@ -105,6 +105,78 @@ public func LTX2VideoAudioRotaryPositionEmbedding(
   )
 }
 
+/// Rotary embeddings of IC-LoRA guide tokens (a reference video such as a pose skeleton), placed
+/// after the video tokens. Guide frame i shares the time position of video frame i. The guide is
+/// encoded on a grid `scale` times smaller: as in Lightricks' small-grid IC-LoRA, guide token
+/// (y, x) sits at (y * scale, x * scale) of the full grid and spans `scale` latent pixels, so its
+/// position is the middle of that span.
+/// - Returns: the self-attention embedding ([1, tokens, heads, channels.0 / heads]) and the
+///   video-to-audio cross-attention embedding ([1, tokens, heads, channels.1 / heads]).
+public func LTX2GuideRotaryPositionEmbedding(
+  time: Int, height: Int, width: Int, scale: Int, channels: (Int, Int), numberOfHeads: Int
+) -> (Tensor<Float>, Tensor<Float>) {
+  let tokenLength = time * height * width
+  var rotVideoTensor = Tensor<Float>(.CPU, .HWC(1, tokenLength, channels.0))
+  let dim0 = channels.0 / 3 / 2
+  let thetas0: [Double] = (0..<dim0).map { pow(10_000, Double($0) / Double(dim0 - 1)) * .pi * 0.5 }
+  let pad = channels.0 / 2 - dim0 * 3
+  let halfSpan = Double(scale) / 2
+  rotVideoTensor.withUnsafeMutableBytes {
+    guard let fp32 = $0.baseAddress?.assumingMemoryBound(to: Float.self) else { return }
+    DispatchQueue.concurrentPerform(iterations: time) { i in
+      let frameStart = max(0, i * 8 - 7)
+      let frameEnd = i * 8 + 1
+      let fractionFrame = Double(frameStart + frameEnd) / 500 - 1
+      for y in 0..<height {
+        let fractionY: Double = (Double(y * scale) + halfSpan) / 32 - 1
+        for x in 0..<width {
+          let fractionX: Double = (Double(x * scale) + halfSpan) / 32 - 1
+          let idx = i * height * width + y * width + x
+          let fp = fp32 + idx * channels.0
+          for j in 0..<pad {
+            fp[j * 2] = 1
+            fp[j * 2 + 1] = 0
+          }
+          for j in 0..<dim0 {
+            let thetaFractionFrame = thetas0[j] * fractionFrame
+            fp[j * 6 + pad * 2] = Float(cos(thetaFractionFrame))
+            fp[j * 6 + pad * 2 + 1] = Float(sin(thetaFractionFrame))
+            let thetaFractionY = thetas0[j] * fractionY
+            fp[j * 6 + pad * 2 + 2] = Float(cos(thetaFractionY))
+            fp[j * 6 + pad * 2 + 3] = Float(sin(thetaFractionY))
+            let thetaFractionX = thetas0[j] * fractionX
+            fp[j * 6 + pad * 2 + 4] = Float(cos(thetaFractionX))
+            fp[j * 6 + pad * 2 + 5] = Float(sin(thetaFractionX))
+          }
+        }
+      }
+    }
+  }
+  var rotVideoToAudioTensor = Tensor<Float>(.CPU, .HWC(1, tokenLength, channels.1))
+  let dim1 = channels.1 / 2
+  let thetas1: [Double] = (0..<dim1).map { pow(10_000, Double($0) / Double(dim1 - 1)) * .pi * 0.5 }
+  rotVideoToAudioTensor.withUnsafeMutableBytes {
+    guard let fp32 = $0.baseAddress?.assumingMemoryBound(to: Float.self) else { return }
+    DispatchQueue.concurrentPerform(iterations: time) { i in
+      let frameStart = max(0, i * 8 - 7)
+      let frameEnd = i * 8 + 1
+      let fractionFrame = Double(frameStart + frameEnd) / 500 - 1
+      for t in 0..<(height * width) {
+        let fp = fp32 + (i * height * width + t) * channels.1
+        for j in 0..<dim1 {
+          let theta = thetas1[j] * fractionFrame
+          fp[j * 2] = Float(cos(theta))
+          fp[j * 2 + 1] = Float(sin(theta))
+        }
+      }
+    }
+  }
+  return (
+    rotVideoTensor.reshaped(.NHWC(1, tokenLength, numberOfHeads, channels.0 / numberOfHeads)),
+    rotVideoToAudioTensor.reshaped(.NHWC(1, tokenLength, numberOfHeads, channels.1 / numberOfHeads))
+  )
+}
+
 public func LTX2ExtractAudioFramesAndHeight(_ shape: TensorShape) -> (Int, Int) {
   let audioFrames = (shape[0] - 1) * 8 + 1
   let audioHeight = (audioFrames + shape[2] * shape[0] - 1) / (shape[2] * shape[0])
@@ -455,8 +527,8 @@ private func FeedForward(hiddenSize: Int, intermediateSize: Int, name: String) -
 }
 
 private func LTX2TransformerBlock(
-  prefix: String, k: (Int, Int), h: Int, b: Int, t: Int, time: Int, hw: Int, a: Int,
-  tokenModulation: Bool, KV: Bool, usesFlashAttention: FlashAttentionLevel,
+  prefix: String, k: (Int, Int), h: Int, b: Int, t: Int, time: Int, hw: Int, guideTokens: Int,
+  a: Int, tokenModulation: Bool, KV: Bool, usesFlashAttention: FlashAttentionLevel,
   useGatedAttention: Bool,
   textCrossAttentionAdaLN: Bool
 ) -> (ModelWeightMapper, Model) {
@@ -473,37 +545,55 @@ private func LTX2TransformerBlock(
   let rotCX = Input()
   let modulations = (0..<(textCrossAttentionAdaLN ? 32 : 22)).map { _ in Input() }
   let norm = RMSNorm(epsilon: 1e-6, axis: [2], elementwiseAffine: false)
+  // Video tokens, then the IC-LoRA guide tokens (if any), which stay at the zero timestep.
+  let n = time * hw + guideTokens
+  precondition(guideTokens == 0 || tokenModulation, "IC-LoRA guide tokens need per-frame modulation.")
+  // Per-frame modulation of the video tokens. Guide tokens use row 0, the zero-timestep row of the
+  // first-frame reference.
+  func frameModulated(_ x: Model.IO, _ scale: Model.IO, _ shift: Model.IO?) -> Model.IO {
+    let c = k.0 * h
+    let video =
+      guideTokens > 0
+      ? x.reshaped([1, time * hw, c], offset: [0, 0, 0], strides: [n * c, c, 1]) : x
+    var videoOut = video.reshaped([time, hw, c]) .* scale
+    if let shift = shift {
+      videoOut = videoOut + shift
+    }
+    videoOut = videoOut.reshaped([1, time * hw, c])
+    guard guideTokens > 0 else { return videoOut }
+    let guide = x.reshaped(
+      [1, guideTokens, c], offset: [0, time * hw, 0], strides: [n * c, c, 1])
+    var guideOut = guide .* scale.reshaped([1, 1, c], offset: [0, 0, 0], strides: [c, c, 1])
+    if let shift = shift {
+      guideOut = guideOut + shift.reshaped([1, 1, c], offset: [0, 0, 0], strides: [c, c, 1])
+    }
+    return Functional.concat(axis: 1, videoOut, guideOut)
+  }
   var out: Model.IO
   if tokenModulation {
-    out = (norm(vx).reshaped([time, hw, k.0 * h]) .* modulations[0] + modulations[1]).reshaped([
-      1, time * hw, k.0 * h,
-    ])
+    out = frameModulated(norm(vx), modulations[0], modulations[1])
   } else {
     out = norm(vx) .* modulations[0] + modulations[1]
   }
   let (attn1Mapper, attn1) = LTX2SelfAttention(
-    prefix: "\(prefix).attn1", k: k.0, h: h, b: b, t: time * hw, name: "x",
+    prefix: "\(prefix).attn1", k: k.0, h: h, b: b, t: n, name: "x",
     usesFlashAttention: usesFlashAttention, useGatedAttention: useGatedAttention)
   if tokenModulation {
     out =
       vx
-      + (attn1(out.to(.Float16), rot).to(of: vx).reshaped([time, hw, k.0 * h]) .* modulations[2])
-      .reshaped([1, time * hw, k.0 * h])
+      + frameModulated(attn1(out.to(.Float16), rot).to(of: vx), modulations[2], nil)
   } else {
     out = vx + attn1(out.to(.Float16), rot).to(of: vx) .* modulations[2]
   }
   let (attn2Mapper, attn2) = LTX2CrossAttention(
-    prefix: "\(prefix).attn2", k: (k.0, k.0, k.0), h: h, b: b, t: (time * hw, t),
+    prefix: "\(prefix).attn2", k: (k.0, k.0, k.0), h: h, b: b, t: (n, t),
     positionEmbedding: false, KV: KV, name: "cv", usesFlashAttention: usesFlashAttention,
     useGatedAttention: useGatedAttention)
   let normOut = norm(out)
   if textCrossAttentionAdaLN {
     let normOutScaled: Model.IO
     if tokenModulation {
-      normOutScaled = (normOut.reshaped([time, hw, k.0 * h]) .* modulations[23] + modulations[22])
-        .reshaped([
-          1, time * hw, k.0 * h,
-        ])
+      normOutScaled = frameModulated(normOut, modulations[23], modulations[22])
     } else {
       normOutScaled = normOut .* modulations[23] + modulations[22]
     }
@@ -525,9 +615,7 @@ private func LTX2TransformerBlock(
     if tokenModulation {
       out =
         out
-        + (attn2Out.reshaped([time, hw, k.0 * h]) .* modulations[24]).reshaped([
-          1, time * hw, k.0 * h,
-        ])
+        + frameModulated(attn2Out, modulations[24], nil)
     } else {
       out = out + attn2Out .* modulations[24]
     }
@@ -577,14 +665,12 @@ private func LTX2TransformerBlock(
   let vxNorm3 = norm(out)
   let axNorm3 = norm(aOut)
   let (audioToVideoAttnMapper, audioToVideoAttn) = LTX2CrossAttention(
-    prefix: "\(prefix).audio_to_video_attn", k: (k.0, k.1, k.1), h: h, b: b, t: (time * hw, a),
+    prefix: "\(prefix).audio_to_video_attn", k: (k.0, k.1, k.1), h: h, b: b, t: (n, a),
     positionEmbedding: true, KV: false, name: "ax", usesFlashAttention: usesFlashAttention,
     useGatedAttention: useGatedAttention)
   let vxScaled: Model.IO
   if tokenModulation {
-    vxScaled = (vxNorm3.reshaped([time, hw, k.0 * h]) .* modulations[6] + modulations[7]).reshaped([
-      1, time * hw, k.0 * h,
-    ])
+    vxScaled = frameModulated(vxNorm3, modulations[6], modulations[7])
   } else {
     vxScaled = vxNorm3 .* modulations[6] + modulations[7]
   }
@@ -593,21 +679,19 @@ private func LTX2TransformerBlock(
   if tokenModulation {
     out =
       out
-      + (audioToVideoAttn(vxScaled.to(.Float16), rotCX, axScaled.to(.Float16), rotA).to(of: out)
-      .reshaped([time, hw, k.0 * h]) .* modulations[10]).reshaped([1, time * hw, k.0 * h])
+      + frameModulated(audioToVideoAttn(vxScaled.to(.Float16), rotCX, axScaled.to(.Float16), rotA).to(of: out), modulations[10], nil)
   } else {
     out =
       out + audioToVideoAttn(vxScaled.to(.Float16), rotCX, axScaled.to(.Float16), rotA).to(of: out)
       .* modulations[10]
   }
   let (videoToAudioAttnMapper, videoToAudioAttn) = LTX2CrossAttention(
-    prefix: "\(prefix).video_to_audio_attn", k: (k.1, k.1, k.0), h: h, b: b, t: (a, time * hw),
+    prefix: "\(prefix).video_to_audio_attn", k: (k.1, k.1, k.0), h: h, b: b, t: (a, n),
     positionEmbedding: true, KV: false, name: "xa", usesFlashAttention: usesFlashAttention,
     useGatedAttention: useGatedAttention)
   let audioVxScaled: Model.IO
   if tokenModulation {
-    audioVxScaled = (vxNorm3.reshaped([time, hw, k.0 * h]) .* modulations[11] + modulations[12])
-      .reshaped([1, time * hw, k.0 * h])
+    audioVxScaled = frameModulated(vxNorm3, modulations[11], modulations[12])
   } else {
     audioVxScaled = vxNorm3 .* modulations[11] + modulations[12]
   }
@@ -623,12 +707,10 @@ private func LTX2TransformerBlock(
     hiddenSize: 4096, intermediateSize: 4096 * 4, name: "x")
   let lastVxScaled: Model.IO
   if tokenModulation {
-    lastVxScaled = (norm(out).reshaped([time, hw, k.0 * h]) .* modulations[16] + modulations[17])
-      .reshaped([1, time * hw, k.0 * h])
+    lastVxScaled = frameModulated(norm(out), modulations[16], modulations[17])
     out =
       out
-      + (xFF(lastVxScaled.to(.Float16)).to(of: out).reshaped([time, hw, k.0 * h]) .* modulations[18])
-      .reshaped([1, time * hw, k.0 * h])
+      + frameModulated(xFF(lastVxScaled.to(.Float16)).to(of: out), modulations[18], nil)
   } else {
     lastVxScaled =
       norm(out) .* modulations[16] + modulations[17]
@@ -716,7 +798,7 @@ public func LTX2(
   time: Int, h: Int, w: Int, textLength: Int, audioFrames: Int, channels: (Int, Int), layers: Int,
   tokenModulation: Bool, KV: Bool, usesFlashAttention: FlashAttentionLevel,
   useGatedAttention: Bool,
-  textCrossAttentionAdaLN: Bool
+  textCrossAttentionAdaLN: Bool, guide: (time: Int, h: Int, w: Int)? = nil
 ) -> (
   ModelWeightMapper, Model
 ) {
@@ -728,6 +810,14 @@ public func LTX2(
     groups: 1, filters: channels.0, filterSize: [1, 1], hint: Hint(stride: [1, 1]), format: .OIHW,
     name: "x_embedder")
   var out = xEmbedder(x).reshaped(.HWC(1, time * h * w, channels.0)).to(.Float32)
+  // IC-LoRA guide (e.g. a pose video): its latents go through the same patch embedding and are
+  // appended after the video tokens.
+  let g: Input? = guide == nil ? nil : Input()
+  let guideTokens = guide.map { $0.time * $0.h * $0.w } ?? 0
+  if let g = g {
+    let guideOut = xEmbedder(g).reshaped(.HWC(1, guideTokens, channels.0)).to(.Float32)
+    out = Functional.concat(axis: 1, out, guideOut)
+  }
   let a = Input()
   let aEmbedder = Dense(count: channels.1, name: "a_embedder")
   var aOut = aEmbedder(a).to(.Float32)
@@ -739,7 +829,8 @@ public func LTX2(
   for i in 0..<layers {
     let (mapper, block) = LTX2TransformerBlock(
       prefix: "transformer_blocks.\(i)", k: (channels.0 / 32, channels.1 / 32), h: 32, b: 1,
-      t: textLength, time: time, hw: hw, a: audioFrames, tokenModulation: tokenModulation, KV: KV,
+      t: textLength, time: time, hw: hw, guideTokens: guideTokens, a: audioFrames,
+      tokenModulation: tokenModulation, KV: KV,
       usesFlashAttention: usesFlashAttention, useGatedAttention: useGatedAttention,
       textCrossAttentionAdaLN: textCrossAttentionAdaLN)
     let modulations = (0..<(textCrossAttentionAdaLN ? 32 : 22)).map { _ in Input() }
@@ -764,6 +855,12 @@ public func LTX2(
   }
   let scaleShiftModulations = [Input(), Input()]
   let normOut = LayerNorm(epsilon: 1e-6, axis: [2], elementwiseAffine: false)
+  if guideTokens > 0 {
+    // Drop the guide tokens: only the video tokens are denoised.
+    let n = time * hw + guideTokens
+    out = out.reshaped(
+      [1, time * hw, channels.0], offset: [0, 0, 0], strides: [n * channels.0, channels.0, 1])
+  }
   if tokenModulation {
     out = normOut(out).reshaped([time, hw, channels.0]) .* scaleShiftModulations[0]
       + scaleShiftModulations[1]
@@ -798,7 +895,7 @@ public func LTX2(
   }
   return (
     mapper,
-    Model([x, a, rot, rotA, rotCX] + modulationsAndKVs, [out, aOut])
+    Model([x, a] + (g.map { [$0] } ?? []) + [rot, rotA, rotCX] + modulationsAndKVs, [out, aOut])
   )
 }
 
@@ -1628,8 +1725,8 @@ private func LoRAFeedForward(
 }
 
 private func LoRALTX2TransformerBlock(
-  prefix: String, k: (Int, Int), h: Int, b: Int, t: Int, time: Int, hw: Int, a: Int,
-  tokenModulation: Bool, layerIndex: Int, KV: Bool, usesFlashAttention: FlashAttentionLevel,
+  prefix: String, k: (Int, Int), h: Int, b: Int, t: Int, time: Int, hw: Int, guideTokens: Int,
+  a: Int, tokenModulation: Bool, layerIndex: Int, KV: Bool, usesFlashAttention: FlashAttentionLevel,
   useGatedAttention: Bool,
   textCrossAttentionAdaLN: Bool, configuration: LoRANetworkConfiguration
 ) -> (ModelWeightMapper, Model) {
@@ -1646,28 +1743,49 @@ private func LoRALTX2TransformerBlock(
   let rotCX = Input()
   let modulations = (0..<(textCrossAttentionAdaLN ? 32 : 22)).map { _ in Input() }
   let norm = RMSNorm(epsilon: 1e-6, axis: [2], elementwiseAffine: false)
+  // Video tokens, then the IC-LoRA guide tokens (if any), which stay at the zero timestep.
+  let n = time * hw + guideTokens
+  precondition(guideTokens == 0 || tokenModulation, "IC-LoRA guide tokens need per-frame modulation.")
+  // Per-frame modulation of the video tokens. Guide tokens use row 0, the zero-timestep row of the
+  // first-frame reference.
+  func frameModulated(_ x: Model.IO, _ scale: Model.IO, _ shift: Model.IO?) -> Model.IO {
+    let c = k.0 * h
+    let video =
+      guideTokens > 0
+      ? x.reshaped([1, time * hw, c], offset: [0, 0, 0], strides: [n * c, c, 1]) : x
+    var videoOut = video.reshaped([time, hw, c]) .* scale
+    if let shift = shift {
+      videoOut = videoOut + shift
+    }
+    videoOut = videoOut.reshaped([1, time * hw, c])
+    guard guideTokens > 0 else { return videoOut }
+    let guide = x.reshaped(
+      [1, guideTokens, c], offset: [0, time * hw, 0], strides: [n * c, c, 1])
+    var guideOut = guide .* scale.reshaped([1, 1, c], offset: [0, 0, 0], strides: [c, c, 1])
+    if let shift = shift {
+      guideOut = guideOut + shift.reshaped([1, 1, c], offset: [0, 0, 0], strides: [c, c, 1])
+    }
+    return Functional.concat(axis: 1, videoOut, guideOut)
+  }
   var out: Model.IO
   if tokenModulation {
-    out = (norm(vx).reshaped([time, hw, k.0 * h]) .* modulations[0] + modulations[1]).reshaped([
-      1, time * hw, k.0 * h,
-    ])
+    out = frameModulated(norm(vx), modulations[0], modulations[1])
   } else {
     out = norm(vx) .* modulations[0] + modulations[1]
   }
   let (attn1Mapper, attn1) = LoRALTX2SelfAttention(
-    prefix: "\(prefix).attn1", k: k.0, h: h, b: b, t: time * hw, layerIndex: layerIndex,
+    prefix: "\(prefix).attn1", k: k.0, h: h, b: b, t: n, layerIndex: layerIndex,
     name: "x", usesFlashAttention: usesFlashAttention, useGatedAttention: useGatedAttention,
     configuration: configuration)
   if tokenModulation {
     out =
       vx
-      + (attn1(out.to(.Float16), rot).to(of: vx).reshaped([time, hw, k.0 * h]) .* modulations[2])
-      .reshaped([1, time * hw, k.0 * h])
+      + frameModulated(attn1(out.to(.Float16), rot).to(of: vx), modulations[2], nil)
   } else {
     out = vx + attn1(out.to(.Float16), rot).to(of: vx) .* modulations[2]
   }
   let (attn2Mapper, attn2) = LoRALTX2CrossAttention(
-    prefix: "\(prefix).attn2", k: (k.0, k.0, k.0), h: h, b: b, t: (time * hw, t),
+    prefix: "\(prefix).attn2", k: (k.0, k.0, k.0), h: h, b: b, t: (n, t),
     positionEmbedding: false, KV: KV, layerIndex: layerIndex,
     name: "cv", usesFlashAttention: usesFlashAttention, useGatedAttention: useGatedAttention,
     configuration: configuration)
@@ -1675,8 +1793,7 @@ private func LoRALTX2TransformerBlock(
   if textCrossAttentionAdaLN {
     let normOutScaled: Model.IO
     if tokenModulation {
-      normOutScaled = (normOut.reshaped([time, hw, k.0 * h]) .* modulations[23] + modulations[22])
-        .reshaped([1, time * hw, k.0 * h])
+      normOutScaled = frameModulated(normOut, modulations[23], modulations[22])
     } else {
       normOutScaled = normOut .* modulations[23] + modulations[22]
     }
@@ -1698,9 +1815,7 @@ private func LoRALTX2TransformerBlock(
     if tokenModulation {
       out =
         out
-        + (attn2Out.reshaped([time, hw, k.0 * h]) .* modulations[24]).reshaped([
-          1, time * hw, k.0 * h,
-        ])
+        + frameModulated(attn2Out, modulations[24], nil)
     } else {
       out = out + attn2Out .* modulations[24]
     }
@@ -1752,15 +1867,13 @@ private func LoRALTX2TransformerBlock(
   let vxNorm3 = norm(out)
   let axNorm3 = norm(aOut)
   let (audioToVideoAttnMapper, audioToVideoAttn) = LoRALTX2CrossAttention(
-    prefix: "\(prefix).audio_to_video_attn", k: (k.0, k.1, k.1), h: h, b: b, t: (time * hw, a),
+    prefix: "\(prefix).audio_to_video_attn", k: (k.0, k.1, k.1), h: h, b: b, t: (n, a),
     positionEmbedding: true, KV: false, layerIndex: layerIndex, name: "ax",
     usesFlashAttention: usesFlashAttention,
     useGatedAttention: useGatedAttention, configuration: configuration)
   let vxScaled: Model.IO
   if tokenModulation {
-    vxScaled = (vxNorm3.reshaped([time, hw, k.0 * h]) .* modulations[6] + modulations[7]).reshaped([
-      1, time * hw, k.0 * h,
-    ])
+    vxScaled = frameModulated(vxNorm3, modulations[6], modulations[7])
   } else {
     vxScaled = vxNorm3 .* modulations[6] + modulations[7]
   }
@@ -1769,8 +1882,7 @@ private func LoRALTX2TransformerBlock(
   if tokenModulation {
     out =
       out
-      + (audioToVideoAttn(vxScaled.to(.Float16), rotCX, axScaled.to(.Float16), rotA).to(of: out)
-      .reshaped([time, hw, k.0 * h]) .* modulations[10]).reshaped([1, time * hw, k.0 * h])
+      + frameModulated(audioToVideoAttn(vxScaled.to(.Float16), rotCX, axScaled.to(.Float16), rotA).to(of: out), modulations[10], nil)
   } else {
     out =
       out
@@ -1778,14 +1890,13 @@ private func LoRALTX2TransformerBlock(
       .* modulations[10]
   }
   let (videoToAudioAttnMapper, videoToAudioAttn) = LoRALTX2CrossAttention(
-    prefix: "\(prefix).video_to_audio_attn", k: (k.1, k.1, k.0), h: h, b: b, t: (a, time * hw),
+    prefix: "\(prefix).video_to_audio_attn", k: (k.1, k.1, k.0), h: h, b: b, t: (a, n),
     positionEmbedding: true, KV: false, layerIndex: layerIndex, name: "xa",
     usesFlashAttention: usesFlashAttention,
     useGatedAttention: useGatedAttention, configuration: configuration)
   let audioVxScaled: Model.IO
   if tokenModulation {
-    audioVxScaled = (vxNorm3.reshaped([time, hw, k.0 * h]) .* modulations[11] + modulations[12])
-      .reshaped([1, time * hw, k.0 * h])
+    audioVxScaled = frameModulated(vxNorm3, modulations[11], modulations[12])
   } else {
     audioVxScaled = vxNorm3 .* modulations[11] + modulations[12]
   }
@@ -1801,12 +1912,10 @@ private func LoRALTX2TransformerBlock(
     configuration: configuration)
   let lastVxScaled: Model.IO
   if tokenModulation {
-    lastVxScaled = (norm(out).reshaped([time, hw, k.0 * h]) .* modulations[16] + modulations[17])
-      .reshaped([1, time * hw, k.0 * h])
+    lastVxScaled = frameModulated(norm(out), modulations[16], modulations[17])
     out =
       out
-      + (xFF(lastVxScaled.to(.Float16)).to(of: out).reshaped([time, hw, k.0 * h]) .* modulations[18])
-      .reshaped([1, time * hw, k.0 * h])
+      + frameModulated(xFF(lastVxScaled.to(.Float16)).to(of: out), modulations[18], nil)
   } else {
     lastVxScaled =
       norm(out) .* modulations[16] + modulations[17]
@@ -1899,7 +2008,7 @@ public func LoRALTX2(
   tokenModulation: Bool, KV: Bool, usesFlashAttention: FlashAttentionLevel,
   useGatedAttention: Bool,
   textCrossAttentionAdaLN: Bool,
-  LoRAConfiguration: LoRANetworkConfiguration
+  LoRAConfiguration: LoRANetworkConfiguration, guide: (time: Int, h: Int, w: Int)? = nil
 ) -> (
   ModelWeightMapper, Model
 ) {
@@ -1911,6 +2020,14 @@ public func LoRALTX2(
     groups: 1, filters: channels.0, filterSize: [1, 1], configuration: LoRAConfiguration,
     hint: Hint(stride: [1, 1]), format: .OIHW, name: "x_embedder")
   var out = xEmbedder(x).reshaped(.HWC(1, time * h * w, channels.0)).to(.Float32)
+  // IC-LoRA guide (e.g. a pose video): its latents go through the same patch embedding and are
+  // appended after the video tokens.
+  let g: Input? = guide == nil ? nil : Input()
+  let guideTokens = guide.map { $0.time * $0.h * $0.w } ?? 0
+  if let g = g {
+    let guideOut = xEmbedder(g).reshaped(.HWC(1, guideTokens, channels.0)).to(.Float32)
+    out = Functional.concat(axis: 1, out, guideOut)
+  }
   let a = Input()
   let aEmbedder = LoRADense(count: channels.1, configuration: LoRAConfiguration, name: "a_embedder")
   var aOut = aEmbedder(a).to(.Float32)
@@ -1922,8 +2039,8 @@ public func LoRALTX2(
   for i in 0..<layers {
     let (mapper, block) = LoRALTX2TransformerBlock(
       prefix: "transformer_blocks.\(i)", k: (channels.0 / 32, channels.1 / 32), h: 32, b: 1,
-      t: textLength, time: time, hw: hw, a: audioFrames, tokenModulation: tokenModulation,
-      layerIndex: i, KV: KV, usesFlashAttention: usesFlashAttention,
+      t: textLength, time: time, hw: hw, guideTokens: guideTokens, a: audioFrames,
+      tokenModulation: tokenModulation, layerIndex: i, KV: KV, usesFlashAttention: usesFlashAttention,
       useGatedAttention: useGatedAttention,
       textCrossAttentionAdaLN: textCrossAttentionAdaLN, configuration: LoRAConfiguration)
     let modulations = (0..<(textCrossAttentionAdaLN ? 32 : 22)).map { _ in Input() }
@@ -1948,6 +2065,12 @@ public func LoRALTX2(
   }
   let scaleShiftModulations = [Input(), Input()]
   let normOut = LayerNorm(epsilon: 1e-6, axis: [2], elementwiseAffine: false)
+  if guideTokens > 0 {
+    // Drop the guide tokens: only the video tokens are denoised.
+    let n = time * hw + guideTokens
+    out = out.reshaped(
+      [1, time * hw, channels.0], offset: [0, 0, 0], strides: [n * channels.0, channels.0, 1])
+  }
   if tokenModulation {
     out = normOut(out).reshaped([time, hw, channels.0]) .* scaleShiftModulations[0]
       + scaleShiftModulations[1]
@@ -1982,7 +2105,7 @@ public func LoRALTX2(
   }
   return (
     mapper,
-    Model([x, a, rot, rotA, rotCX] + modulationsAndKVs, [out, aOut])
+    Model([x, a] + (g.map { [$0] } ?? []) + [rot, rotA, rotCX] + modulationsAndKVs, [out, aOut])
   )
 }
 

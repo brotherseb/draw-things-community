@@ -4787,6 +4787,23 @@ extension LocalImageGenerator {
         ltxAudioReference = reference
       }
       let ltxReferenceAudios = ltxAudioReference.map { [$0] } ?? []
+      // LTX-2.3 IC-LoRA guide (pose video): a multi-frame pose hint, [frames, height, width, 3], at
+      // the first-pass size divided by the LoRA's reference downscale factor. Encoded with the
+      // video VAE and passed after the first-frame reference; the transformer appends its tokens
+      // to the video tokens at the zero timestep. First pass only, as in Lightricks' workflows.
+      var ltxGuideReferences = [DynamicGraph.Tensor<FloatType>]()
+      if modelVersion == .ltx2_3, !firstPassImageCond.1.isEmpty, let pose = poses.first?.0,
+        pose.shape.count == 4, pose.shape[0] > 1
+      {
+        let encoded = firstStage.encode(
+          graph.variable(pose.toGPU(0)), encoder: nil, cancellation: cancellation
+        ).0
+        let shape = encoded.shape
+        let frames = min(shape[0], batchSize.0)
+        ltxGuideReferences = [
+          firstStage.scale(encoded[0..<frames, 0..<shape[1], 0..<shape[2], 0..<128].contiguous())
+        ]
+      }
       // Writes the reference audio into the audio rows (the last `audioHeight` rows) of a latent.
       func withLTXAudio(_ x: DynamicGraph.Tensor<FloatType>, audioHeight: Int)
         -> DynamicGraph.Tensor<FloatType>
@@ -4827,7 +4844,7 @@ extension LocalImageGenerator {
                 sampler: sampler, scale: firstPassScale, tokenLengthUncond: tokenLengthUncond,
                 tokenLengthCond: tokenLengthCond), sample: nil,
               conditionImage: maskedImage ?? firstPassImageCond.0,
-              referenceImages: firstPassImageCond.1,
+              referenceImages: firstPassImageCond.1 + ltxGuideReferences,
               referenceAudios: encodedAudioCond + ltxReferenceAudios,
               mask: mask, negMask: nil, conditioning: c, tokenLengthUncond: tokenLengthUncond,
               tokenLengthCond: tokenLengthCond, extraProjection: extraProjection,
