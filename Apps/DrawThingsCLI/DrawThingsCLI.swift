@@ -4289,7 +4289,8 @@ public struct DrawThingsCLI: ParsableCommand {
     discussion: CLIHelpText.root,
     version: CLIIdentity.version,
     subcommands: [
-      Generate.self, Auth.self, Models.self, Train.self, ImportLoRA.self, Completion.self,
+      Generate.self, Auth.self, Models.self, Train.self, ImportLoRA.self, MergeLoRA.self,
+      Completion.self,
     ]
   )
 
@@ -6285,6 +6286,147 @@ extension DrawThingsCLI {
       context.print(
         "Converted \(path) as \(importedVersion.rawValue) to \(outputPath) (exists: \(FileManager.default.fileExists(atPath: outputPath)))"
       )
+    }
+  }
+}
+
+extension DrawThingsCLI {
+  /// Bakes a LoRA into a copy of a (quantized) model. On quantized models the engine runs LoRAs
+  /// as a separate branch, which for the LTX-2.3 IC-LoRA triples the step time and fills the
+  /// memory. Only the tensors the LoRA touches are rewritten (merged in FP16, then re-encoded:
+  /// q6p for matrices, q8p for convolutions); every other tensor stays byte-identical. The copy is
+  /// registered in custom.json with the base model's specification.
+  struct MergeLoRA: DrawThingsCLICommand {
+    static let configuration = CommandConfiguration(
+      commandName: "merge-lora",
+      abstract: "Bake a LoRA into a copy of a model in the models directory.")
+
+    @OptionGroup var modelsDirectoryOptions: ModelsDirectoryOptions
+
+    @Option(name: .long, help: "Base model file in the models directory.")
+    var model: String
+
+    @Option(name: .long, help: "LoRA file in the models directory (Draw Things format).")
+    var lora: String
+
+    @Option(name: .long, help: "LoRA weight.")
+    var weight: Float = 1
+
+    @Option(name: .long, help: "Output model file name in the models directory.")
+    var output: String
+
+    @Option(name: .long, help: "Display name of the new model.")
+    var name: String?
+
+    mutating func run(context: DrawThingsCLIContext) throws {
+      let modelsDirectory = try ModelsDirectoryResolver.resolve(
+        context: context, path: modelsDirectoryOptions.modelsDir)
+      ModelZoo.isExternalUrlsPreferred = true
+      ModelZoo.externalUrls = [modelsDirectory]
+      guard var specification = ModelZoo.specificationForModel(model) else {
+        throw ValidationError("Unknown model: \(model)")
+      }
+      let modelPath = ModelZoo.filePathForModelDownloaded(model)
+      let loraPath = ModelZoo.filePathForModelDownloaded(lora)
+      let outputPath = ModelZoo.filePathForModelDownloaded(output)
+      let fileManager = FileManager.default
+      guard fileManager.fileExists(atPath: modelPath) else {
+        throw ValidationError("Model not found: \(modelPath)")
+      }
+      guard fileManager.fileExists(atPath: loraPath) else {
+        throw ValidationError("LoRA not found: \(loraPath)")
+      }
+      guard !fileManager.fileExists(atPath: outputPath) else {
+        throw ValidationError("Output already exists: \(outputPath)")
+      }
+      context.print("Copying \(modelPath) to \(outputPath)...")
+      try fileManager.copyItem(atPath: modelPath, toPath: outputPath)
+      let modelExternal = modelPath + "-tensordata"
+      if fileManager.fileExists(atPath: modelExternal) {
+        try fileManager.copyItem(
+          atPath: modelExternal, toPath: outputPath + "-tensordata")
+      }
+      // Base names of the tensors the LoRA patches.
+      let graph = DynamicGraph()
+      var names = [String]()
+      graph.openStore(loraPath, flags: .readOnly) { store in
+        for key in store.keys where key.hasSuffix("__down__") {
+          names.append(String(key.dropLast("__down__".count)))
+        }
+      }
+      names.sort()
+      context.print("LoRA patches \(names.count) tensor(s).")
+      let loraConfiguration = LoRAConfiguration(
+        file: loraPath, weight: weight, version: specification.version, isLoHa: false,
+        modifier: .none, mode: .all)
+      var merged = 0
+      var skipped = [String]()
+      graph.withNoGrad {
+        graph.openStore(
+          modelPath, flags: .readOnly, externalStore: modelPath + "-tensordata"
+        ) { baseStore in
+          graph.openStore(
+            outputPath, externalStore: outputPath + "-tensordata"
+          ) { outputStore in
+            LoRALoader.openStore(graph, lora: [loraConfiguration]) { loader in
+              for name in names {
+                guard
+                  let original = baseStore.read(
+                    name, kind: .CPU, codec: [.q6p, .q8p, .ezm7, .externalData])
+                else {
+                  skipped.append(name)
+                  continue
+                }
+                let shape = original.shape
+                let result = loader.mergeLoRA(
+                  graph, name: name, store: baseStore, dataType: .Float16, shape: shape,
+                  of: Float16.self)
+                guard case .final(let tensor) = result else {
+                  skipped.append(name)
+                  continue
+                }
+                let fp16 = Tensor<Float16>(from: tensor).toCPU()
+                let squeezedDims = shape.reduce(0) { $1 > 1 ? 1 + $0 : $0 }
+                if shape.count == 2 && squeezedDims > 1 {
+                  outputStore.write(name, tensor: fp16, codec: [.q6p, .ezm7])
+                } else if shape.count == 4 && squeezedDims > 1 {
+                  outputStore.write(name, tensor: fp16, codec: [.q8p, .ezm7])
+                } else {
+                  outputStore.write(name, tensor: fp16, codec: .ezm7)
+                }
+                merged += 1
+                if merged % 50 == 0 {
+                  context.print("  merged \(merged) / \(names.count)")
+                }
+              }
+            }
+          }
+        }
+      }
+      context.print("Merged \(merged) tensor(s), skipped \(skipped.count).")
+      if !skipped.isEmpty {
+        context.print("Skipped (first 10): \(skipped.prefix(10).joined(separator: ", "))")
+      }
+      // Register the copy with the base model's specification.
+      specification.file = output
+      specification.name = name ?? "\(specification.name) + \(lora)"
+      let jsonFile = ModelZoo.filePathForOtherModelDownloaded("custom.json")
+      var entries = [[String: Any]]()
+      if let data = try? Data(contentsOf: URL(fileURLWithPath: jsonFile)),
+        let existing = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
+      {
+        entries = existing.filter { ($0["file"] as? String) != output }
+      }
+      let encoder = JSONEncoder()
+      encoder.keyEncodingStrategy = .convertToSnakeCase
+      let specificationData = try encoder.encode(specification)
+      if let entry = try JSONSerialization.jsonObject(with: specificationData) as? [String: Any] {
+        entries.append(entry)
+      }
+      let data = try JSONSerialization.data(
+        withJSONObject: entries, options: [.prettyPrinted, .sortedKeys])
+      try data.write(to: URL(fileURLWithPath: jsonFile), options: .atomic)
+      context.print("Registered \(output) in \(jsonFile).")
     }
   }
 }
