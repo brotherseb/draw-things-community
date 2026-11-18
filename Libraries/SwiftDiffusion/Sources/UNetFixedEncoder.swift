@@ -3768,6 +3768,9 @@ extension UNetFixedEncoder {
       // smaller): its tokens follow the video tokens, so their embeddings follow too.
       if referenceImages.count > 1 {
         let guideShape = referenceImages[1].shape
+        FileHandle.standardError.write(
+          "LTX guide: rotary embeddings for \(guideShape) next to \(batchSize)x\(h)x\(w)\n".data(
+            using: .utf8)!)
         let (guideRotary, guideRotaryVideoToAudio) = LTX2GuideRotaryPositionEmbedding(
           time: guideShape[0], height: guideShape[1], width: guideShape[2],
           scale: max(1, h / guideShape[1]), channels: (4096, 2048), numberOfHeads: 32)
