@@ -23,6 +23,25 @@ public enum LTX2AudioEncoding {
     return 1 + sampleCount / hopLength
   }
 
+  /// Cuts `[startTime, startTime + duration)` out of a [channels, samples] waveform, zero-padding
+  /// past the end of the file. Returns nil when the start lies beyond the end of the audio.
+  public static func segment(
+    _ waveform: Tensor<Float>, sampleRate: Int, startTime: Double, duration: Double
+  ) -> Tensor<Float>? {
+    precondition(waveform.shape.count == 2)
+    let channels = waveform.shape[0]
+    let totalSamples = waveform.shape[1]
+    let startSample = max(0, Int((startTime * Double(sampleRate)).rounded()))
+    let segmentSamples = max(1, Int((duration * Double(sampleRate)).rounded()))
+    guard startSample < totalSamples else { return nil }
+    let copiedSamples = min(segmentSamples, totalSamples - startSample)
+    var segment = Tensor<Float>(
+      Array(repeating: 0, count: channels * segmentSamples), .CPU, .NC(channels, segmentSamples))
+    segment[0..<channels, 0..<copiedSamples] =
+      waveform[0..<channels, startSample..<(startSample + copiedSamples)]
+    return segment
+  }
+
   /// Number of latent frames the encoder produces for `melFrames` mel frames.
   public static func latentFrameCount(melFrames: Int) -> Int {
     // Causal stride-2 convolution with 2 frames of left padding: out = (in - 1) / 2 + 1, applied twice.
@@ -253,4 +272,26 @@ public struct LTX2AudioVAE {
       return waveform.reshaped(.NC(waveform.shape[1], waveform.shape[3])).rawValue.toCPU()
     }
   }
+}
+
+/// LTX-2.3 per-layer modulation outputs (index modulo 32, final norm at 32 + i) that are computed
+/// from the audio timestep or the audio sigma. See `LTX2TransformerBlockFixed` for the order:
+/// 3...5, 19...21, 25...27 audio AdaLN; 8, 9 and 13, 14 audio-side cross-attention scale / shift;
+/// 10 the audio-to-video gate (driven by the audio sigma in ltx-core); 30, 31 audio prompt AdaLN;
+/// 34, 35 audio output norm.
+let LTX2_3AudioTimestepModulationIndices: Set<Int> = [
+  3, 4, 5, 8, 9, 10, 13, 14, 19, 20, 21, 25, 26, 27, 30, 31, 34, 35,
+]
+
+/// Replaces the audio stream input of the LTX-2 transformer with the clean reference audio
+/// latents ([1, audioFrames, 128]), so the audio stays fixed while the video is denoised.
+func LTX2FrozenAudioInput<FloatType: TensorNumeric & BinaryFloatingPoint>(
+  _ audioInput: DynamicGraph.Tensor<FloatType>, reference: DynamicGraph.AnyTensor
+) -> DynamicGraph.Tensor<FloatType> {
+  let reference = DynamicGraph.Tensor<FloatType>(reference)
+  var audioInput = audioInput
+  let frames = min(audioInput.shape[1], reference.shape[1])
+  let channels = min(audioInput.shape[2], reference.shape[2])
+  audioInput[0..<1, 0..<frames, 0..<channels] = reference[0..<1, 0..<frames, 0..<channels]
+  return audioInput
 }

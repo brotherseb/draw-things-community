@@ -1152,7 +1152,8 @@ extension LocalImageGenerator {
 
     let audioHint = hints.first(where: { $0.0 == .audio })?.1 ?? []
     // Audio hints carry one Float32 PCM tensor in [channels, samples] order, resampled to
-    // ModelZoo.audioSampleRateForModel. Feature tensors stay inside the model-specific path.
+    // ModelZoo.audioSampleRateForModel (LTX-2.3: 16 kHz, the audio VAE encoder rate, already cut
+    // to the clip). Feature tensors stay inside the model-specific path.
     let audio = audioHint.first?.0 as? Tensor<Float>
     if !audioHint.isEmpty {
       guard audioHint.count == 1, let audio, audio.kind == .CPU, audio.shape.count == 2,
@@ -1183,6 +1184,10 @@ extension LocalImageGenerator {
           ImageGeneratorUtils.modifierForModel(
             file, LoRAs: configuration.loras.compactMap { $0.file }) == .ref2va
         else { return (nil, nil, 1) }
+      case .ltx2_3:
+        // Audio-to-video: the audio hint is the 16 kHz waveform of the clip, encoded with the LTX
+        // audio VAE and kept clean while the video is denoised. Needs the first-frame image.
+        guard audioContext == nil, image != nil, audio != nil else { return (nil, nil, 1) }
       default:
         return (nil, nil, 1)
       }
@@ -1213,9 +1218,10 @@ extension LocalImageGenerator {
       shift = Double(configuration.shift)
     }
     let sampling = Sampling(steps: Int(configuration.steps), shift: shift)
+    let ltxAudio: Tensor<Float>? = modelVersion == .ltx2_3 ? audio : nil
     let audioContext =
       audioContext
-      ?? audio.map { waveform in
+      ?? (ltxAudio != nil ? nil : audio).map { waveform in
         let encoderFilePath = ModelZoo.audioEncoderForModel(file).map {
           fileMapping[$0] ?? ModelZoo.filePathForModelDownloaded($0)
         }
@@ -1246,7 +1252,7 @@ extension LocalImageGenerator {
         shuffles: shuffles, poses: poses, text: text,
         negativeText: negativeText, configuration: configuration,
         denoiserParameterization: denoiserParameterization, sampling: sampling,
-        cancellation: cancellation, feedback: feedback)
+        ltxAudio: ltxAudio, cancellation: cancellation, feedback: feedback)
     }
     return generateImageWithMask(
       image, scaleFactor: scaleFactor, mask: mask, depth: depth, hints: hints, custom: custom,
@@ -5378,6 +5384,7 @@ extension LocalImageGenerator {
     negativeText: String, configuration: GenerationConfiguration,
     denoiserParameterization: Denoiser.Parameterization, sampling: Sampling,
     colorCalibrationMask: Tensor<UInt8>? = nil,
+    ltxAudio: Tensor<Float>? = nil,
     cancellation: (@escaping () -> Void) -> Void,
     feedback:
       @escaping (ImageGeneratorSignpost, Set<ImageGeneratorSignpost>, Tensor<FloatType>?) ->
@@ -6084,6 +6091,39 @@ extension LocalImageGenerator {
       sample = injectVACEFrames(
         batchSize: batchSize, version: modelVersion, image: sample,
         injectedControls: injectedControls)
+      // Audio-to-video (LTX-2.3): encode the clip's audio with the audio VAE. The latents go
+      // to the sampler as a reference audio, which the transformer reads as clean conditioning
+      // (zero audio timestep) at every step, and fill the audio rows of the latent.
+      var ltxAudioReference: DynamicGraph.Tensor<FloatType>? = nil
+      if let ltxAudio, audioHeight > 0 {
+        guard let audioMean = latentsScaling.audioMean, let audioStd = latentsScaling.audioStd,
+          audioMean.count == channels, audioStd.count == channels
+        else { return (nil, nil, 1) }
+        let audioFrames = LTX2ExtractAudioFramesAndHeight([batchSize.0, 1, startWidth]).0
+        let mel = LTX2AudioMelSpectrogram(waveform: ltxAudio)
+        let encoded = LTX2AudioVAE(filePath: firstStageFilePath).encode(
+          mel, latentsMean: audioMean, latentsStd: audioStd, graph: graph)
+        let copiedFrames = min(audioFrames, encoded.shape[1])
+        var reference = graph.variable(
+          .GPU(0), .HWC(1, audioFrames, channels), of: FloatType.self)
+        reference.full(0)
+        let encodedOnGPU = graph.variable(Tensor<FloatType>(from: encoded).toGPU(0))
+        reference[0..<1, 0..<copiedFrames, 0..<channels] =
+          encodedOnGPU[0..<1, 0..<copiedFrames, 0..<channels]
+        ltxAudioReference = reference
+      }
+      func withLTXAudio(_ x: DynamicGraph.Tensor<FloatType>) -> DynamicGraph.Tensor<FloatType> {
+        guard let ltxAudioReference else { return x }
+        let shape = x.shape
+        var packed = graph.variable(
+          .GPU(0), .HWC(1, shape[0] * audioHeight * shape[2], shape[3]), of: FloatType.self)
+        packed.full(0)
+        packed[0..<1, 0..<ltxAudioReference.shape[1], 0..<shape[3]] = ltxAudioReference
+        var x = x.copied()
+        x[0..<shape[0], (shape[1] - audioHeight)..<shape[1], 0..<shape[2], 0..<shape[3]] =
+          packed.reshaped(.NHWC(shape[0], audioHeight, shape[2], shape[3]))
+        return x
+      }
       if audioHeight > 0 {
         let audioLatents = graph.variable(
           .GPU(0), .HWC(1, batchSize.0 * startWidth * audioHeight, channels), of: FloatType.self)
@@ -6091,6 +6131,7 @@ extension LocalImageGenerator {
         sample = Functional.concat(
           axis: 1, sample,
           audioLatents.reshaped(.NHWC(batchSize.0, audioHeight, startWidth, channels)))
+        sample = withLTXAudio(sample)
       }
       let x_T: DynamicGraph.Tensor<FloatType>
       if initTimestep.startStep > 0 {
@@ -6116,12 +6157,12 @@ extension LocalImageGenerator {
         var x =
           try? modelPreloader.consumeUNet(
             sampler.sample(
-              x_T,
+              withLTXAudio(x_T),
               unets: modelPreloader.retrieveUNet(
                 sampler: sampler, scale: imageScale, tokenLengthUncond: tokenLengthUncond,
                 tokenLengthCond: tokenLengthCond), sample: nil,
               conditionImage: maskedImage ?? imageCond.0, referenceImages: imageCond.1,
-              referenceAudios: [],
+              referenceAudios: ltxAudioReference.map { [$0] } ?? [],
               mask: mask, negMask: nil, conditioning: c, tokenLengthUncond: tokenLengthUncond,
               tokenLengthCond: tokenLengthCond, extraProjection: extraProjection,
               injectedControls: injectedControls, textGuidanceScale: textGuidanceScale,
@@ -6297,6 +6338,8 @@ extension LocalImageGenerator {
       }
       x = applyImageCond(
         x, modifier: modifier, version: modelVersion, imageCond: imageCond)
+      // Decode the clip's own audio rather than what the sampler left in the audio rows.
+      x = withLTXAudio(x)
       if DeviceCapability.isLowPerformance {
         graph.garbageCollect()
         DynamicGraph.vacuum()
