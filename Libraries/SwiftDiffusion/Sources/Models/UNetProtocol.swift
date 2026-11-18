@@ -2284,9 +2284,6 @@ extension UNetFromNNC {
             let textLength = inputs[inputs.count - 2].shape[1]
             // An IC-LoRA guide latent, when present, comes right after the audio.
             let guideShape: TensorShape? = inputs.count > 2 + 1545 ? inputs[2].shape : nil
-            FileHandle.standardError.write(
-              "LTX guide: building the LoRA transformer, video \(shape), guide \(String(describing: guideShape))\n"
-                .data(using: .utf8)!)
             return LoRALTX2(
               time: shape[0], h: shape[1], w: shape[2], textLength: textLength,
               audioFrames: audioFrames, channels: (4096, 2048), layers: 48,
@@ -2306,9 +2303,6 @@ extension UNetFromNNC {
             let textLength = inputs[inputs.count - 2].shape[1]
             // An IC-LoRA guide latent, when present, comes right after the audio.
             let guideShape: TensorShape? = inputs.count > 2 + 1545 ? inputs[2].shape : nil
-            FileHandle.standardError.write(
-              "LTX guide: building the transformer, video \(shape), guide \(String(describing: guideShape))\n"
-                .data(using: .utf8)!)
             return LTX2(
               time: shape[0], h: shape[1], w: shape[2], textLength: textLength,
               audioFrames: audioFrames, channels: (4096, 2048), layers: 48,

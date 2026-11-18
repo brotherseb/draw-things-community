@@ -4795,14 +4795,10 @@ extension LocalImageGenerator {
       if modelVersion == .ltx2_3, !firstPassImageCond.1.isEmpty, let pose = poses.first?.0,
         pose.shape.count == 4, pose.shape[0] > 1
       {
-        FileHandle.standardError.write(
-          "LTX guide: encoding \(pose.shape) with the video VAE\n".data(using: .utf8)!)
         let encoded = firstStage.encode(
           graph.variable(pose.toGPU(0)), encoder: nil, cancellation: cancellation
         ).0
         let shape = encoded.shape
-        FileHandle.standardError.write(
-          "LTX guide: latent \(shape), video latent frames \(batchSize.0)\n".data(using: .utf8)!)
         let frames = min(shape[0], batchSize.0)
         ltxGuideReferences = [
           firstStage.scale(encoded[0..<frames, 0..<shape[1], 0..<shape[2], 0..<128].contiguous())
