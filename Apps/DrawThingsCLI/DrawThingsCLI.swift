@@ -3136,13 +3136,17 @@ private func cliProgressText(
     if step == steps {
       return ("Finishing...", nil)
     }
-    return ("Sampling...", "\(step + 1) / \(steps)")
+    let hasSecondPass = signposts.contains {
+      if case .secondPassSampling = $0 { return true }
+      return false
+    }
+    return (hasSecondPass ? "Pass 1/2..." : "Sampling...", "\(step + 1) / \(steps)")
   case .secondPassSampling(let step):
     let steps = cliSamplingSteps(signposts: signposts, isSecondPassSampling: true)
     if step == steps {
       return ("Finishing...", nil)
     }
-    return ("Sampling...", "\(step + 1) / \(steps)")
+    return ("Pass 2/2...", "\(step + 1) / \(steps)")
   case .imageDecoded:
     if signposts.contains(.secondPassImageDecoded) {
       return ("Processing...", nil)
