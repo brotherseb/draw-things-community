@@ -3100,6 +3100,19 @@ private func printGenerationTimingSummary(
   context.print(
     "  Sampling step time (\(summary.samplingStepDurations.count) step(s)): avg \(formatDurationForCLI(averageStepDuration)), median \(formatDurationForCLI(medianStepDuration))"
   )
+  // Per-pass averages leave out the last step of each pass, which ends with no later signpost.
+  for pass in SamplingETA.passDurations.keys.sorted() {
+    let durations = SamplingETA.passDurations[pass] ?? []
+    guard !durations.isEmpty else { continue }
+    context.print(
+      "  Pass \(pass): avg \(formatDurationForCLI(durations.reduce(0, +) / Double(durations.count))) over \(durations.count) step(s)"
+    )
+  }
+  if SamplingETA.peakFootprint > 0 {
+    context.print(
+      "  Peak memory footprint during sampling: \(String(format: "%.1f", Double(SamplingETA.peakFootprint) / 1_073_741_824)) GB"
+    )
+  }
 }
 
 private func cliSamplingSteps(
@@ -3123,6 +3136,59 @@ private func cliSamplingSteps(
   return 0
 }
 
+/// Remaining time of the current sampling pass, from the average duration of its finished steps
+/// (the first step includes model loading, so the estimate settles after a few steps). Also keeps
+/// the per-pass step durations and the peak memory footprint for the timing summary.
+private enum SamplingETA {
+  private static var pass = 0
+  private static var passStart = Date()
+  private static var lastStep = -1
+  private static var lastStepStart = Date()
+  static var passDurations = [Int: [Double]]()
+  static var peakFootprint: UInt64 = 0
+
+  static func estimate(pass: Int, step: Int, steps: Int) -> String {
+    let now = Date()
+    peakFootprint = max(peakFootprint, currentFootprint())
+    if pass != Self.pass || step < lastStep {
+      if step < lastStep && pass <= Self.pass {
+        passDurations = [:]
+        peakFootprint = currentFootprint()
+      }
+      Self.pass = pass
+      passStart = now
+      lastStep = -1
+    }
+    if step != lastStep {
+      if lastStep >= 0 {
+        passDurations[pass, default: []].append(now.timeIntervalSince(lastStepStart))
+      }
+      lastStep = step
+      lastStepStart = now
+    }
+    guard step > 0, step < steps else { return "" }
+    let remaining = now.timeIntervalSince(passStart) / Double(step) * Double(steps - step)
+    let minutes = Int((remaining / 60).rounded())
+    return minutes >= 1 ? " · ~\(minutes) min left" : " · <1 min left"
+  }
+
+  static func currentFootprint() -> UInt64 {
+    #if canImport(Darwin)
+      var info = task_vm_info_data_t()
+      var count = mach_msg_type_number_t(
+        MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
+      let result = withUnsafeMutablePointer(to: &info) {
+        $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+          task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+        }
+      }
+      return result == KERN_SUCCESS ? info.phys_footprint : 0
+    #else
+      return 0
+    #endif
+  }
+}
+
 private func cliProgressText(
   signpost: ImageGeneratorSignpost, signposts: Set<ImageGeneratorSignpost>
 ) -> (label: String, detail: String?) {
@@ -3140,13 +3206,19 @@ private func cliProgressText(
       if case .secondPassSampling = $0 { return true }
       return false
     }
-    return (hasSecondPass ? "Pass 1/2..." : "Sampling...", "\(step + 1) / \(steps)")
+    return (
+      hasSecondPass ? "Pass 1/2..." : "Sampling...",
+      "\(step + 1) / \(steps)" + SamplingETA.estimate(pass: 1, step: step, steps: steps)
+    )
   case .secondPassSampling(let step):
     let steps = cliSamplingSteps(signposts: signposts, isSecondPassSampling: true)
     if step == steps {
       return ("Finishing...", nil)
     }
-    return ("Pass 2/2...", "\(step + 1) / \(steps)")
+    return (
+      "Pass 2/2...",
+      "\(step + 1) / \(steps)" + SamplingETA.estimate(pass: 2, step: step, steps: steps)
+    )
   case .imageDecoded:
     if signposts.contains(.secondPassImageDecoded) {
       return ("Processing...", nil)
