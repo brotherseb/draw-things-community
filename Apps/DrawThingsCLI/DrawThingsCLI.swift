@@ -578,6 +578,12 @@ struct GenerateImageInputOptions: ParsableArguments {
   var audioStartTime: Double = 0
 
   @Option(
+    name: .customLong("ltx-color-match"),
+    help:
+      "LTX: per-frame color stabilization of the video latents towards the first frame (Lightricks' AdaIN), blend factor from 0 (off) to 1.")
+  var ltxColorMatch: Float?
+
+  @Option(
     name: .customLong("audio-encoder-file"),
     help:
       "Audio encoder checkpoint filename in the models directory (defaults to the model's encoder)."
@@ -4600,6 +4606,11 @@ extension DrawThingsCLI {
           fallbackAudio = audioInput.waveformTensor(
             videoFrames: videoFrames, framesPerSecond: fps)
         }
+      }
+      if let ltxColorMatch = imageInput.ltxColorMatch {
+        // Prototype plumbing: read by LocalImageGenerator for LTX models.
+        setenv("DRAWTHINGS_LTX_COLOR_MATCH", String(ltxColorMatch), 1)
+        context.print("LTX color match: \(ltxColorMatch)")
       }
       let runner = try LocalGenerationRunner(context: context)
       let livePreviewSession =
