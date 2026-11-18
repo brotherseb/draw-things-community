@@ -4212,7 +4212,9 @@ public struct DrawThingsCLI: ParsableCommand {
     abstract: "Local inference and training CLI for Draw Things models.",
     discussion: CLIHelpText.root,
     version: CLIIdentity.version,
-    subcommands: [Generate.self, Auth.self, Models.self, Train.self, Completion.self]
+    subcommands: [
+      Generate.self, Auth.self, Models.self, Train.self, ImportLoRA.self, Completion.self,
+    ]
   )
 
   private static let invocationCondition = NSCondition()
@@ -6169,4 +6171,44 @@ private func parseWeightsMemoryValue(_ value: Any?) throws -> LoRATrainer.Weight
   throw ValidationError(
     "Invalid weights_memory_management value in --config-json. Use enum raw value or one of: cached, justInTime."
   )
+}
+
+extension DrawThingsCLI {
+  /// Converts a LoRA with an explicit model version, for LoRAs whose family the importer cannot
+  /// detect (an LTX-2.3 IC-LoRA has no audio weights and is detected as PixArt). The converted file
+  /// is not registered in custom_lora.json: pass its version in --config-json loras[].version.
+  struct ImportLoRA: DrawThingsCLICommand {
+    static let configuration = CommandConfiguration(
+      commandName: "import-lora",
+      abstract: "Convert a LoRA for a given model version into the models directory.")
+
+    @OptionGroup var modelsDirectoryOptions: ModelsDirectoryOptions
+
+    @Argument(help: "LoRA file (.safetensors).")
+    var file: String
+
+    @Option(name: .long, help: "Model version raw value, for example ltx2.3.")
+    var version: String
+
+    @Option(name: .long, help: "Output file name in the models directory.")
+    var output: String
+
+    mutating func run(context: DrawThingsCLIContext) throws {
+      let modelsDirectory = try ModelsDirectoryResolver.resolve(
+        context: context, path: modelsDirectoryOptions.modelsDir)
+      ModelZoo.isExternalUrlsPreferred = true
+      ModelZoo.externalUrls = [modelsDirectory]
+      guard let modelVersion = ModelVersion(rawValue: version) else {
+        throw ValidationError("Unknown model version: \(version)")
+      }
+      let path = URL(fileURLWithPath: context.path(file)).standardizedFileURL.path
+      let (importedVersion, _, _, _) = try ModelOp.LoRAImporter.import(
+        downloadedFile: path, name: output, filename: output, scaleFactor: 1,
+        forceVersion: modelVersion, progress: { _ in })
+      let outputPath = ModelZoo.filePathForModelDownloaded(output)
+      context.print(
+        "Converted \(path) as \(importedVersion.rawValue) to \(outputPath) (exists: \(FileManager.default.fileExists(atPath: outputPath)))"
+      )
+    }
+  }
 }

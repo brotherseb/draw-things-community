@@ -4807,57 +4807,6 @@ extension LocalImageGenerator {
         ltxGuideReferences = [
           firstStage.scale(encoded[0..<frames, 0..<shape[1], 0..<shape[2], 0..<128].contiguous())
         ]
-        // Temporary check: decode the guide back and compare it with the input, per latent frame.
-        do {
-          let latent = ltxGuideReferences[0]
-          let latentCPU = Tensor<Float>(from: latent.rawValue.toCPU())
-          let ls = latentCPU.shape
-          var report = "LTX guide check: latent mean/std per frame:"
-          for f in 0..<ls[0] {
-            var sum: Double = 0
-            var sumSq: Double = 0
-            let count = ls[1] * ls[2] * ls[3]
-            for y in 0..<ls[1] {
-              for x in 0..<ls[2] {
-                for c in 0..<ls[3] {
-                  let v = Double(latentCPU[f, y, x, c])
-                  sum += v
-                  sumSq += v * v
-                }
-              }
-            }
-            let mean = sum / Double(count)
-            report += String(format: " %d:%.2f/%.2f", f, mean, (sumSq / Double(count) - mean * mean).squareRoot())
-          }
-          let decoded = firstStage.decode(latent, decoder: nil, cancellation: cancellation).0
-          let decodedCPU = Tensor<Float>(from: decoded.rawValue.toCPU())
-          let ds = decodedCPU.shape
-          report += "\nLTX guide check: decoded \(ds), mean |decoded - input| and decoded mean per 8 frames:"
-          let input = pose
-          let frames = min(ds[0], input.shape[0])
-          var start = 0
-          while start < frames {
-            let end = start == 0 ? 1 : min(start + 8, frames)
-            var err: Double = 0
-            var mean: Double = 0
-            var count = 0
-            for t in start..<end {
-              for y in stride(from: 0, to: min(ds[1], input.shape[1]), by: 4) {
-                for x in stride(from: 0, to: min(ds[2], input.shape[2]), by: 4) {
-                  for c in 0..<3 {
-                    let d = Double(decodedCPU[t, y, x, c])
-                    err += abs(d - Double(input[t, y, x, c]))
-                    mean += d
-                    count += 1
-                  }
-                }
-              }
-            }
-            report += String(format: " [%d-%d] %.3f/%.3f", start, end - 1, err / Double(count), mean / Double(count))
-            start = end
-          }
-          FileHandle.standardError.write((report + "\n").data(using: .utf8)!)
-        }
       }
       // Writes the reference audio into the audio rows (the last `audioHeight` rows) of a latent.
       func withLTXAudio(_ x: DynamicGraph.Tensor<FloatType>, audioHeight: Int)
