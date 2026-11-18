@@ -13,8 +13,6 @@ public enum LTX2AudioEncoding {
   public static let fftSize = 1_024
   public static let hopLength = 160
   public static let melBins = 64
-  /// Mel frames per latent frame (two stride-2 downsamplings along time).
-  public static let latentDownsampleFactor = 4
   /// Width of one patched latent frame: 8 latent channels x 16 frequency bins.
   public static let latentFeatures = 128
 
@@ -40,13 +38,6 @@ public enum LTX2AudioEncoding {
     segment[0..<channels, 0..<copiedSamples] =
       waveform[0..<channels, startSample..<(startSample + copiedSamples)]
     return segment
-  }
-
-  /// Number of latent frames the encoder produces for `melFrames` mel frames.
-  public static func latentFrameCount(melFrames: Int) -> Int {
-    // Causal stride-2 convolution with 2 frames of left padding: out = (in - 1) / 2 + 1, applied twice.
-    let first = (melFrames - 1) / 2 + 1
-    return (first - 1) / 2 + 1
   }
 }
 
@@ -120,10 +111,11 @@ public func LTX2AudioMelSpectrogram(waveform: Tensor<Float>) -> Tensor<Float> {
   var frame = [Float](repeating: 0, count: nFFT)
   var magnitude = [Float](repeating: 0, count: freqBins)
   let pad = nFFT / 2
-  for channel in 0..<2 {
-    let sourceChannel = min(channel, inputChannels - 1)
+  // Mono input is duplicated to stereo: compute it once and copy.
+  let computedChannels = min(inputChannels, 2)
+  for channel in 0..<computedChannels {
     for i in 0..<sampleCount {
-      samples[i] = waveform[sourceChannel, i]
+      samples[i] = waveform[channel, i]
     }
     for t in 0..<frames {
       let start = t * hopLength - pad
@@ -156,19 +148,24 @@ public func LTX2AudioMelSpectrogram(waveform: Tensor<Float>) -> Tensor<Float> {
       }
     }
   }
+  if computedChannels == 1 {
+    for t in 0..<frames {
+      for m in 0..<melBins {
+        result[0, 1, t, m] = result[0, 0, t, m]
+      }
+    }
+  }
   return result
 }
 
-/// LTX-2 / LTX-2.3 audio VAE: encoder (mel spectrogram to normalized latents) and decoder
-/// (normalized latents to waveform), reading weights from the audio-video VAE checkpoint
-/// (blocks `audio_encoder`, `audio_decoder` and `vocoder`).
-public struct LTX2AudioVAE {
+/// Encoder half of the LTX-2 / LTX-2.3 audio VAE (mel spectrogram to normalized latents), reading
+/// the `audio_encoder` block of the audio-video VAE checkpoint. Decoding goes through the existing
+/// audio decoder and vocoder of the video pipeline.
+public struct LTX2AudioVAEEncoder {
   public let filePath: String
-  public let isLTX2_3: Bool
 
-  public init(filePath: String, isLTX2_3: Bool = true) {
+  public init(filePath: String) {
     self.filePath = filePath
-    self.isLTX2_3 = isLTX2_3
   }
 
   /// Encodes a mel spectrogram into normalized, patched latents.
@@ -211,65 +208,6 @@ public struct LTX2AudioVAE {
         Tensor<Float>(latentsStd.map { 1 / $0 }, .GPU(0), .HWC(1, 1, latentsStd.count)))
       let normalized = inverseStd .* (patched + negativeMean)
       return normalized.rawValue.toCPU()
-    }
-  }
-
-  /// Decodes normalized, patched latents ([1, latentFrames, 128]) back to a waveform.
-  /// - Returns: [channels, samples] on CPU, at `ModelZoo.audioSampleRateForModel` for the model
-  ///   (48 kHz for LTX-2.3, which uses the vocoder with bandwidth extension).
-  public func decode(
-    _ latents: Tensor<Float>, latentsMean: [Float], latentsStd: [Float], graph: DynamicGraph
-  ) -> Tensor<Float> {
-    precondition(latents.shape.count == 3 && latents.shape[2] == LTX2AudioEncoding.latentFeatures)
-    return graph.withNoGrad {
-      let latentFrames = latents.shape[1]
-      let z = graph.variable(latents.toGPU(0))
-      let mean = graph.variable(
-        Tensor<Float>(latentsMean, .GPU(0), .HWC(1, 1, latentsMean.count)))
-      let std = graph.variable(
-        Tensor<Float>(latentsStd, .GPU(0), .HWC(1, 1, latentsStd.count)))
-      let audioZ = std .* z + mean
-      let decodedAudioWidth = (latentFrames - 1) * 4 + 1
-      let decoder = LTX2AudioDecoderCausal2D(
-        channels: [128, 256, 512], numRepeat: 3, startWidth: 16, startHeight: latentFrames
-      ).1
-      let vocoder: Model
-      let vocoderLoader: (() -> Void)?
-      if isLTX2_3 {
-        let (_, vocoderModel, loader) = LTX2VocoderWithBWE(width: decodedAudioWidth)
-        vocoder = vocoderModel
-        vocoderLoader = loader
-      } else {
-        vocoder = LTX2Vocoder(
-          width: decodedAudioWidth, initialChannels: 1024,
-          layers: [
-            (channels: 512, kernelSize: 16, stride: 6, padding: 5),
-            (channels: 256, kernelSize: 15, stride: 5, padding: 5),
-            (channels: 128, kernelSize: 8, stride: 2, padding: 3),
-            (channels: 64, kernelSize: 4, stride: 2, padding: 1),
-            (channels: 32, kernelSize: 4, stride: 2, padding: 1),
-          ], resblockKernelSizes: [3, 7, 11],
-          resblockDilations: [[1, 3, 5], [1, 3, 5], [1, 3, 5]], activation: .leakyReLU,
-          finalConvBias: true, finalActivation: .tanh
-        ).1
-        vocoderLoader = nil
-      }
-      decoder.maxConcurrency = .limit(4)
-      decoder.compile(inputs: audioZ)
-      let decodedPlaceholder = graph.variable(
-        .GPU(0), format: .NCHW, shape: [1, 128, 1, decodedAudioWidth], of: Float.self)
-      vocoder.maxConcurrency = .limit(4)
-      vocoder.compile(inputs: decodedPlaceholder)
-      vocoderLoader?()
-      graph.openStore(
-        filePath, flags: .readOnly, externalStore: TensorData.externalStore(filePath: filePath)
-      ) {
-        $0.read("audio_decoder", model: decoder, codec: [.jit, .externalData])
-        $0.read("vocoder", model: vocoder, codec: [.jit, .externalData])
-      }
-      let decoded = decoder(inputs: audioZ)[0].as(of: Float.self)
-      let waveform = vocoder(inputs: decoded)[0].as(of: Float.self)
-      return waveform.reshaped(.NC(waveform.shape[1], waveform.shape[3])).rawValue.toCPU()
     }
   }
 }

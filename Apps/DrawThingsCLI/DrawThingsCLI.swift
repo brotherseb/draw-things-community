@@ -578,12 +578,6 @@ struct GenerateImageInputOptions: ParsableArguments {
   var audioStartTime: Double = 0
 
   @Option(
-    name: .customLong("ltx-color-match"),
-    help:
-      "LTX: per-frame color stabilization of the video latents towards the first frame (Lightricks' AdaIN), blend factor from 0 (off) to 1.")
-  var ltxColorMatch: Float?
-
-  @Option(
     name: .customLong("audio-encoder-file"),
     help:
       "Audio encoder checkpoint filename in the models directory (defaults to the model's encoder)."
@@ -4206,9 +4200,7 @@ public struct DrawThingsCLI: ParsableCommand {
     abstract: "Local inference and training CLI for Draw Things models.",
     discussion: CLIHelpText.root,
     version: CLIIdentity.version,
-    subcommands: [
-      Generate.self, Auth.self, Models.self, Train.self, LTXAudioRoundTrip.self, Completion.self,
-    ]
+    subcommands: [Generate.self, Auth.self, Models.self, Train.self, Completion.self]
   )
 
   private static let invocationCondition = NSCondition()
@@ -4606,11 +4598,6 @@ extension DrawThingsCLI {
           fallbackAudio = audioInput.waveformTensor(
             videoFrames: videoFrames, framesPerSecond: fps)
         }
-      }
-      if let ltxColorMatch = imageInput.ltxColorMatch {
-        // Prototype plumbing: read by LocalImageGenerator for LTX models.
-        setenv("DRAWTHINGS_LTX_COLOR_MATCH", String(ltxColorMatch), 1)
-        context.print("LTX color match: \(ltxColorMatch)")
       }
       let runner = try LocalGenerationRunner(context: context)
       let livePreviewSession =
@@ -6091,167 +6078,4 @@ private func parseWeightsMemoryValue(_ value: Any?) throws -> LoRATrainer.Weight
   throw ValidationError(
     "Invalid weights_memory_management value in --config-json. Use enum raw value or one of: cached, justInTime."
   )
-}
-
-extension DrawThingsCLI {
-  /// Test command for LTX audio-to-video work: encodes an audio segment with the LTX-2.3 audio VAE
-  /// encoder, decodes it back with the audio decoder and vocoder, and writes the result as a WAV.
-  /// Listening to the output validates the mel spectrogram, the encoder and the latent layout
-  /// before any of it is used to condition generation.
-  struct LTXAudioRoundTrip: DrawThingsCLICommand {
-    static let configuration = CommandConfiguration(
-      commandName: "ltx-audio-roundtrip",
-      abstract:
-        "Encode an audio segment with the LTX audio VAE, decode it back and write a WAV (test).")
-
-    @OptionGroup var modelsDirectoryOptions: ModelsDirectoryOptions
-
-    @Option(name: .long, help: "Input audio file (any format AVFoundation can read).")
-    var audio: String
-
-    @Option(name: .customLong("audio-start-time"), help: "Start of the segment, in seconds.")
-    var audioStartTime: Double = 0
-
-    @Option(name: .long, help: "Length of the segment, in seconds.")
-    var duration: Double = 5
-
-    @Option(name: .long, help: "LTX model whose audio latent statistics are used.")
-    var model: String = "ltx_2.3_22b_distilled_1.1_q6p.ckpt"
-
-    @Option(name: .long, help: "Audio-video VAE file in the models directory.")
-    var vae: String = "ltx_2.3_audio_video_vae_f16.ckpt"
-
-    @Option(name: .shortAndLong, help: "Output WAV path.")
-    var output: String
-
-    mutating func run(context: DrawThingsCLIContext) throws {
-      let modelsDirectory = try ModelsDirectoryResolver.resolve(
-        context: context, path: modelsDirectoryOptions.modelsDir)
-      ModelZoo.isExternalUrlsPreferred = true
-      ModelZoo.externalUrls = [modelsDirectory]
-      context.print("Models directory: \(modelsDirectory.path)")
-      let scaling = ModelZoo.latentsScalingForModel(model)
-      guard let audioMean = scaling.audioMean, let audioStd = scaling.audioStd,
-        audioMean.count == LTX2AudioEncoding.latentFeatures,
-        audioStd.count == LTX2AudioEncoding.latentFeatures
-      else {
-        throw ValidationError("No 128-wide audio latent statistics for model \(model).")
-      }
-      let vaePath = ModelZoo.filePathForModelDownloaded(vae)
-      guard FileManager.default.fileExists(atPath: vaePath) else {
-        throw ValidationError("Audio-video VAE not found: \(vaePath)")
-      }
-      let isLTX2_3 = ModelZoo.versionForModel(model) == .ltx2_3
-      let outputSampleRate = ModelZoo.audioSampleRateForModel(model)
-
-      // 1. Load and cut the segment at 16 kHz.
-      let input = try AudioInput(contentsOf: audio, sampleRate: LTX2AudioEncoding.sampleRate)
-      let channels = input.waveform.shape[0]
-      let totalSamples = input.waveform.shape[1]
-      let startSample = max(0, Int((audioStartTime * Double(LTX2AudioEncoding.sampleRate)).rounded()))
-      let wantedSamples = Int((duration * Double(LTX2AudioEncoding.sampleRate)).rounded())
-      let segmentSamples = min(wantedSamples, totalSamples - startSample)
-      guard segmentSamples > LTX2AudioEncoding.fftSize else {
-        throw ValidationError("The audio segment is empty or too short.")
-      }
-      var segment = Tensor<Float>(.CPU, .NC(channels, segmentSamples))
-      for c in 0..<channels {
-        for i in 0..<segmentSamples {
-          segment[c, i] = input.waveform[c, startSample + i]
-        }
-      }
-      context.print(
-        "Input: \(channels) channel(s), \(segmentSamples) samples at 16 kHz (\(String(format: "%.2f", Double(segmentSamples) / 16_000)) s)"
-      )
-
-      // 2. Mel spectrogram.
-      var start = Date()
-      let mel = LTX2AudioMelSpectrogram(waveform: segment)
-      context.print(
-        "Mel spectrogram: \(mel.shape) in \(String(format: "%.2f", Date().timeIntervalSince(start))) s, \(statistics(mel))"
-      )
-
-      // 3. Encode.
-      let graph = DynamicGraph()
-      let vaeModel = LTX2AudioVAE(filePath: vaePath, isLTX2_3: isLTX2_3)
-      start = Date()
-      let latents = vaeModel.encode(
-        mel, latentsMean: audioMean, latentsStd: audioStd, graph: graph)
-      context.print(
-        "Latents: \(latents.shape) in \(String(format: "%.2f", Date().timeIntervalSince(start))) s, \(statistics(latents)) (expected: mean near 0, std near 1)"
-      )
-
-      // 4. Decode.
-      start = Date()
-      let waveform = vaeModel.decode(
-        latents, latentsMean: audioMean, latentsStd: audioStd, graph: graph)
-      context.print(
-        "Decoded waveform: \(waveform.shape) at \(outputSampleRate) Hz in \(String(format: "%.2f", Date().timeIntervalSince(start))) s, \(statistics(waveform))"
-      )
-
-      // 5. Write a 32-bit float WAV.
-      try writeFloatWAV(waveform, sampleRate: outputSampleRate, to: output)
-      context.print("Wrote: \(output)")
-    }
-
-    private func statistics(_ tensor: Tensor<Float>) -> String {
-      let count = tensor.shape.reduce(1, *)
-      var minimum = Float.greatestFiniteMagnitude
-      var maximum = -Float.greatestFiniteMagnitude
-      var sum: Double = 0
-      var sumOfSquares: Double = 0
-      var nonFinite = 0
-      tensor.withUnsafeBytes {
-        let values = $0.bindMemory(to: Float.self)
-        for i in 0..<count {
-          let value = values[i]
-          guard value.isFinite else {
-            nonFinite += 1
-            continue
-          }
-          minimum = min(minimum, value)
-          maximum = max(maximum, value)
-          sum += Double(value)
-          sumOfSquares += Double(value) * Double(value)
-        }
-      }
-      let finite = max(count - nonFinite, 1)
-      let mean = sum / Double(finite)
-      let std = (max(sumOfSquares / Double(finite) - mean * mean, 0)).squareRoot()
-      return String(
-        format: "min %.3f max %.3f mean %.3f std %.3f non-finite %ld", minimum, maximum, mean, std,
-        nonFinite)
-    }
-
-    private func writeFloatWAV(_ waveform: Tensor<Float>, sampleRate: Int, to path: String) throws {
-      let channels = waveform.shape[0]
-      let frames = waveform.shape[1]
-      var data = Data()
-      func append<T: FixedWidthInteger>(_ value: T) {
-        withUnsafeBytes(of: value.littleEndian) { data.append(contentsOf: $0) }
-      }
-      let bytesPerSample = 4
-      let dataSize = frames * channels * bytesPerSample
-      data.append(contentsOf: Array("RIFF".utf8))
-      append(UInt32(36 + dataSize))
-      data.append(contentsOf: Array("WAVE".utf8))
-      data.append(contentsOf: Array("fmt ".utf8))
-      append(UInt32(16))
-      append(UInt16(3))  // IEEE float
-      append(UInt16(channels))
-      append(UInt32(sampleRate))
-      append(UInt32(sampleRate * channels * bytesPerSample))
-      append(UInt16(channels * bytesPerSample))
-      append(UInt16(32))
-      data.append(contentsOf: Array("data".utf8))
-      append(UInt32(dataSize))
-      data.reserveCapacity(data.count + dataSize)
-      for i in 0..<frames {
-        for c in 0..<channels {
-          append(waveform[c, i].bitPattern)
-        }
-      }
-      try data.write(to: URL(fileURLWithPath: path))
-    }
-  }
 }

@@ -4774,7 +4774,7 @@ extension LocalImageGenerator {
         else { return (nil, nil, 1) }
         let audioFrames = LTX2ExtractAudioFramesAndHeight([batchSize.0, 1, firstPassStartWidth]).0
         let mel = LTX2AudioMelSpectrogram(waveform: ltxAudio)
-        let encoded = LTX2AudioVAE(
+        let encoded = LTX2AudioVAEEncoder(
           filePath: ModelZoo.filePathForModelDownloaded(autoencoderFile)
         ).encode(mel, latentsMean: audioMean, latentsStd: audioStd, graph: graph)
         let copiedFrames = min(audioFrames, encoded.shape[1])
@@ -4787,12 +4787,6 @@ extension LocalImageGenerator {
         ltxAudioReference = reference
       }
       let ltxReferenceAudios = ltxAudioReference.map { [$0] } ?? []
-      // LTX color stabilization: per-frame AdaIN of the video latents towards the first-frame
-      // latent (Lightricks' LTXVAdainLatent). Prototype switch: DRAWTHINGS_LTX_COLOR_MATCH holds
-      // the blend factor (0 or unset = off), set by the CLI's --ltx-color-match.
-      let ltxColorMatchFactor: Float =
-        (modelVersion == .ltx2 || modelVersion == .ltx2_3)
-        ? (Float(ProcessInfo.processInfo.environment["DRAWTHINGS_LTX_COLOR_MATCH"] ?? "") ?? 0) : 0
       // Writes the reference audio into the audio rows (the last `audioHeight` rows) of a latent.
       func withLTXAudio(_ x: DynamicGraph.Tensor<FloatType>, audioHeight: Int)
         -> DynamicGraph.Tensor<FloatType>
@@ -4863,10 +4857,6 @@ extension LocalImageGenerator {
       x = applyImageCond(
         x, modifier: modifier, version: modelVersion, imageCond: firstPassImageCond)
       x = withLTXAudio(x, audioHeight: firstPassAudioHeight)
-      if ltxColorMatchFactor != 0, let firstFrame = firstPassImageCond.1.first {
-        x = LTXLatentColorMatch(
-          x, reference: firstFrame, videoHeight: firstPassStartHeight, factor: ltxColorMatchFactor)
-      }
       if modelVersion == .longcatVideoAvatar1_5, videoContinuationFrames != nil {
         let shape = x.shape
         x = x[1..<shape[0], 0..<shape[1], 0..<shape[2], 0..<shape[3]].copied()
@@ -5369,10 +5359,6 @@ extension LocalImageGenerator {
       x = applyImageCond(
         x, modifier: modifier, version: modelVersion, imageCond: secondPassImageCond)
       x = withLTXAudio(x, audioHeight: audioHeight)
-      if ltxColorMatchFactor != 0, let firstFrame = secondPassImageCond.1.first {
-        x = LTXLatentColorMatch(
-          x, reference: firstFrame, videoHeight: startHeight, factor: ltxColorMatchFactor)
-      }
       if modelVersion == .v2 || modelVersion == .sdxlBase || modelVersion == .sdxlRefiner
         || modelVersion == .ssd1b || modelVersion == .wurstchenStageC || modelVersion == .sd3
         || modelVersion == .pixart
