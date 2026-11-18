@@ -6361,7 +6361,7 @@ extension DrawThingsCLI {
         modifier: .none, mode: .all)
       var merged = 0
       var skipped = [String]()
-      graph.withNoGrad {
+      _ = graph.withNoGrad {
         graph.openStore(
           modelPath, flags: .readOnly, externalStore: modelPath + "-tensordata"
         ) { baseStore in
@@ -6410,7 +6410,7 @@ extension DrawThingsCLI {
       // Register the copy with the base model's specification.
       specification.file = output
       specification.name = name ?? "\(specification.name) + \(lora)"
-      let jsonFile = ModelZoo.filePathForOtherModelDownloaded("custom.json")
+      let jsonFile = modelsDirectory.appendingPathComponent("custom.json").path
       var entries = [[String: Any]]()
       if let data = try? Data(contentsOf: URL(fileURLWithPath: jsonFile)),
         let existing = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
