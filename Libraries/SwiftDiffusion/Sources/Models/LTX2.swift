@@ -552,10 +552,12 @@ private func LTX2TransformerBlock(
   // first-frame reference.
   func frameModulated(_ x: Model.IO, _ scale: Model.IO, _ shift: Model.IO?) -> Model.IO {
     let c = k.0 * h
+    // One alias level: an alias of a strided alias trips the symbolic graph's bounds check.
     let video =
       guideTokens > 0
-      ? x.reshaped([1, time * hw, c], offset: [0, 0, 0], strides: [n * c, c, 1]) : x
-    var videoOut = video.reshaped([time, hw, c]) .* scale
+      ? x.reshaped([time, hw, c], offset: [0, 0, 0], strides: [hw * c, c, 1])
+      : x.reshaped([time, hw, c])
+    var videoOut = video .* scale
     if let shift = shift {
       videoOut = videoOut + shift
     }
@@ -1750,10 +1752,12 @@ private func LoRALTX2TransformerBlock(
   // first-frame reference.
   func frameModulated(_ x: Model.IO, _ scale: Model.IO, _ shift: Model.IO?) -> Model.IO {
     let c = k.0 * h
+    // One alias level: an alias of a strided alias trips the symbolic graph's bounds check.
     let video =
       guideTokens > 0
-      ? x.reshaped([1, time * hw, c], offset: [0, 0, 0], strides: [n * c, c, 1]) : x
-    var videoOut = video.reshaped([time, hw, c]) .* scale
+      ? x.reshaped([time, hw, c], offset: [0, 0, 0], strides: [hw * c, c, 1])
+      : x.reshaped([time, hw, c])
+    var videoOut = video .* scale
     if let shift = shift {
       videoOut = videoOut + shift
     }
