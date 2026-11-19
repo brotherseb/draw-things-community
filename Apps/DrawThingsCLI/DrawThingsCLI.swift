@@ -6264,8 +6264,9 @@ extension DrawThingsCLI {
     @Argument(help: "LoRA file (.safetensors).")
     var file: String
 
-    @Option(name: .long, help: "Model version raw value, for example ltx2.3.")
-    var version: String
+    @Option(
+      name: .long, help: "Model version raw value, for example ltx2.3. Detected when omitted.")
+    var version: String?
 
     @Option(name: .long, help: "Output file name in the models directory.")
     var output: String
@@ -6275,8 +6276,11 @@ extension DrawThingsCLI {
         context: context, path: modelsDirectoryOptions.modelsDir)
       ModelZoo.isExternalUrlsPreferred = true
       ModelZoo.externalUrls = [modelsDirectory]
-      guard let modelVersion = ModelVersion(rawValue: version) else {
-        throw ValidationError("Unknown model version: \(version)")
+      let modelVersion = try version.map {
+        guard let modelVersion = ModelVersion(rawValue: $0) else {
+          throw ValidationError("Unknown model version: \($0)")
+        }
+        return modelVersion
       }
       let path = URL(fileURLWithPath: context.path(file)).standardizedFileURL.path
       let (importedVersion, _, _, _) = try ModelOp.LoRAImporter.import(
