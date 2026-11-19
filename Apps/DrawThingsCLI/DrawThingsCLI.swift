@@ -624,6 +624,15 @@ struct GenerateExecutionOptions: ParsableArguments {
   @Flag(name: .long, help: "Disable live sampling preview during generation.")
   var disablePreview: Bool = false
 
+  @Option(
+    name: .long,
+    help: ArgumentHelp(
+      "Write the live sampling preview to this PNG file, rewritten at every step.",
+      discussion:
+        "For front ends that run the CLI without a terminal. Local generation only. The file is replaced atomically, so it can be read at any time. The preview is a low-resolution approximation of the latent; for a video it shows the middle frame."
+    ))
+  var previewFile: String?
+
   @Flag(
     name: .long,
     help: ArgumentHelp(
@@ -3253,6 +3262,18 @@ private enum TerminalImageRenderer {
     private let previewRows: Int
     private var didReserveRegion = false
     private var didRenderFinalImage = false
+    /// When set, previews go to this file instead of the terminal (--preview-file).
+    private let previewFileURL: URL?
+
+    /// A session that only writes previews to a file: no terminal needed.
+    init(context: DrawThingsCLIContext, previewFile: String, modelVersion: ModelVersion) {
+      self.context = context
+      self.resolvedProtocol = .iterm2
+      self.modelVersion = modelVersion
+      self.previewColumns = 0
+      self.previewRows = 0
+      self.previewFileURL = URL(fileURLWithPath: previewFile)
+    }
 
     private init?(
       context: DrawThingsCLIContext, mode: TerminalImageRenderMode,
@@ -3270,6 +3291,7 @@ private enum TerminalImageRenderer {
       self.context = context
       self.resolvedProtocol = resolvedProtocol
       self.modelVersion = modelVersion
+      self.previewFileURL = nil
       let previewSize = TerminalImageRenderer.fittedPreviewSize(
         for: outputPixelSize, environment: environment)
       switch resolvedProtocol {
@@ -3284,8 +3306,18 @@ private enum TerminalImageRenderer {
     }
 
     func update(tensor: Tensor<FloatType>) {
+      // The TAESD decoder crashes the CLI when it runs without a terminal session, so the file
+      // preview uses the plain latent-to-RGB approximation: small and soft, but safe.
       let previewImages = ImageConverter.cgImages(
-        fromLatent: tensor, canUseTAESD: true, version: modelVersion)
+        fromLatent: tensor, canUseTAESD: previewFileURL == nil, version: modelVersion)
+      if let previewFileURL {
+        // A video preview has one image per latent frame: the middle one tells more than the
+        // first, which usually repeats the start image.
+        let images = previewImages.0
+        guard !images.isEmpty, let data = pngData(from: images[images.count / 2]) else { return }
+        try? data.write(to: previewFileURL, options: .atomic)
+        return
+      }
       guard let previewImage = previewImages.0.first else { return }
       switch resolvedProtocol {
       case .iterm2:
@@ -3309,6 +3341,7 @@ private enum TerminalImageRenderer {
     }
 
     func renderFinalImage(path: String) throws -> Bool {
+      guard previewFileURL == nil else { return false }
       let fileURL = URL(fileURLWithPath: path)
       switch resolvedProtocol {
       case .iterm2:
@@ -3333,6 +3366,7 @@ private enum TerminalImageRenderer {
     }
 
     func finish() {
+      guard previewFileURL == nil else { return }
       switch resolvedProtocol {
       case .iterm2:
         guard didReserveRegion else { return }
@@ -4691,12 +4725,21 @@ extension DrawThingsCLI {
         }
       }
       let runner = try LocalGenerationRunner(context: context)
-      let livePreviewSession =
-        livePreviewEnabled
-        ? TerminalImageRenderer.LivePreviewSession.make(
-          context: context, mode: terminalImageMode, protocolChoice: output.terminalImageProtocol,
-          configuration: configuration)
-        : nil
+      let livePreviewSession: TerminalImageRenderer.LivePreviewSession?
+      if let previewFile = execution.previewFile, !execution.disablePreview {
+        // Works with an output file and without a terminal, unlike the terminal preview.
+        livePreviewSession = TerminalImageRenderer.LivePreviewSession(
+          context: context, previewFile: previewFile,
+          modelVersion: ModelZoo.versionForModel(configuration.model ?? ""))
+      } else {
+        livePreviewSession =
+          livePreviewEnabled
+          ? TerminalImageRenderer.LivePreviewSession.make(
+            context: context, mode: terminalImageMode,
+            protocolChoice: output.terminalImageProtocol,
+            configuration: configuration)
+          : nil
+      }
       defer {
         livePreviewSession?.finish()
       }
