@@ -597,7 +597,7 @@ struct GenerateImageInputOptions: ParsableArguments {
   @Option(
     name: .customLong("ltx-color-match"),
     help:
-      "LTX color stabilization of the video latents: off (default), first (match every frame to the first frame, Lightricks' AdaIN) or smooth (match every frame to the moving average of its neighbours: evens out short jumps, keeps slow lighting changes).")
+      "LTX color stabilization of the video latents: off (default), first (match every frame to the first frame, Lightricks' AdaIN) or smooth (shift the mean color of every frame towards the moving average of its neighbours, texture untouched: evens out short jumps, keeps slow lighting changes).")
   var ltxColorMatch: String = "off"
 
   @Option(

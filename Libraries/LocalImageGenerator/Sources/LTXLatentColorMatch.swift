@@ -3,16 +3,18 @@ import NNC
 
 /// Color stabilization of LTX video latents (prototype, fork only).
 ///
-/// Both modes are a per-frame AdaIN: for every latent frame and channel, the mean and standard
-/// deviation over the frame are moved towards a target, then blended with `strength` (0 leaves
-/// the latents unchanged, 1 applies the full match).
-/// - `first`: the target is the encoded first frame, as Lightricks' `LTXVAdainLatent` node
-///   (ComfyUI-LTXVideo, latent_norm.py) with `per_frame` enabled. It removes slow drift, but it
-///   also flattens real lighting changes (fades, light moving over a long shot).
-/// - `smooth`: the target is the moving average of the frame statistics over `radius` latent
-///   frames on each side (one latent frame is 8 video frames). Short jumps of brightness or color
-///   cast, such as the beat at the 8-frame latent boundaries, are evened out, while slow, real
-///   changes are kept. The first latent frame (the conditioning image) is left as it is.
+/// Both modes work per latent frame and channel, blended with `strength` (0 leaves the latents
+/// unchanged, 1 applies the full correction).
+/// - `first`: full AdaIN (mean and standard deviation) towards the encoded first frame, as
+///   Lightricks' `LTXVAdainLatent` node (ComfyUI-LTXVideo, latent_norm.py) with `per_frame`
+///   enabled. It removes slow drift, but it also flattens real lighting changes, and rescaling
+///   the standard deviation alters texture as well as color.
+/// - `smooth`: only the mean of each channel is moved, towards its moving average over `radius`
+///   latent frames on each side (one latent frame is 8 video frames). Short jumps of brightness or
+///   color cast, such as the beat at the 8-frame latent boundaries, are evened out, slow real
+///   changes are kept, and the spread of the latents (which carries texture) is not touched: a
+///   first version that also matched the standard deviation made the skin blotchy from one block
+///   to the next. The first latent frame (the conditioning image) is left as it is.
 /// Only the video rows (the first `videoHeight` rows of each frame) are touched; packed audio rows
 /// below them are copied as they are.
 enum LTXColorMatchMode: String {
@@ -142,8 +144,10 @@ func LTXLatentColorMatch<FloatType: TensorNumeric & BinaryFloatingPoint>(
     for f in firstFrame..<frames {
       let frameBase = f * frameSize
       var scale = [Double](repeating: 1, count: channels)
-      for c in 0..<channels {
-        scale[c] = targetStds[f][c] / max(frameStds[f][c], 1e-6)
+      if settings.mode == .first {
+        for c in 0..<channels {
+          scale[c] = targetStds[f][c] / max(frameStds[f][c], 1e-6)
+        }
       }
       for i in 0..<plane {
         let base = frameBase + i * channels
