@@ -112,6 +112,9 @@ public enum ComputeUnits {
     case .minimaxH3:
       let frames = Int(configuration.numFrames)
       return (cfgChannels, frames == 1 ? 1 : ((max(frames, 5) - 5 + 16) / 17) * 5 + 2)
+    case .minimaxH3Image:
+      // The H3 graph treats its batch as frames, so H3 Image generates one image at a time.
+      return (cfgChannels, 1)
     }
   }
 
@@ -140,7 +143,7 @@ public enum ComputeUnits {
       return paddedLength
     }
     switch version {
-    case .flux1, .minimaxH3:
+    case .flux1, .minimaxH3, .minimaxH3Image:
       return 512
     case .hunyuanVideo:
       return 256
@@ -173,7 +176,7 @@ public enum ComputeUnits {
         Int((Double(rawWidth) * 3.0 / 2.0).rounded(.up)),
         Int((Double(rawHeight) * 3.0 / 2.0).rounded(.up))
       )
-    case .wan22_5b, .minimaxH3, .qwenImage2_1:
+    case .wan22_5b, .minimaxH3, .qwenImage2_1, .minimaxH3Image:
       return (rawWidth * 4, rawHeight * 4)
     case .ltx2, .ltx2_3:
       return (rawWidth * 2, rawHeight * 2)
@@ -202,6 +205,7 @@ public enum ComputeUnits {
     _ configuration: GenerationConfiguration,
     context: ResolvedModelContext,
     hasImage: Bool,
+    imageFrames: Int,
     shuffleCount: Int
   ) -> (main: Int, fixed: Int) {
     let modelStartSize = modelStartSizeFromConfiguration(
@@ -215,9 +219,15 @@ public enum ComputeUnits {
       1, defaultTokenLength(modelName: context.modelName, version: context.modelVersion))
     let tokenLengths = (baseTokenLength, baseTokenLength)
     let referenceLengthPerImage = max(1, (startHeight / 2) * (startWidth / 2))
+    // A reference clip for MiniMax H3 Ref2VA is its latent frames stacked, each as long as a
+    // picture: 17 n + 5 frames make 5 n + 2 latent frames. Anything shorter is one picture.
+    let referenceClipFrames =
+      hasImage && context.samplerModifier == .ref2va && imageFrames >= 22
+      ? (imageFrames - 5) / 17 * 5 + 2 : 1
     let referenceSequenceLength =
       referenceLengthPerImage
-      * referenceImageCount(context: context, hasImage: hasImage, shuffleCount: shuffleCount)
+      * (referenceImageCount(context: context, hasImage: hasImage, shuffleCount: shuffleCount)
+        + referenceClipFrames - 1)
 
     switch context.modelVersion {
     case .minimaxH3:
@@ -234,6 +244,16 @@ public enum ComputeUnits {
         timesteps: max(1, Int(configuration.steps)), hiddenSize: 5_376, layers: 50,
         textLength: (cfgChannels > 1 ? baseTokenLength : 0, baseTokenLength),
         referenceSequenceLength: referenceSequenceLength)
+      return (main: mainCount * batchSize, fixed: fixedCount)
+    case .minimaxH3Image:
+      let mainCount = MiniMaxH3InstructionCount(
+        videoTime: 1, videoHeight: startHeight, videoWidth: startWidth, audioLength: 0,
+        textLength: baseTokenLength, referenceSequenceLength: referenceSequenceLength,
+        includeAudio: false, pddSteps: MiniMaxH3Configuration.imageHeadSigmas.count)
+      let fixedCount = MiniMaxH3FixedInstructionCount(
+        timesteps: max(1, Int(configuration.steps)), hiddenSize: 5_376, layers: 50,
+        textLength: (cfgChannels > 1 ? baseTokenLength : 0, baseTokenLength),
+        referenceSequenceLength: referenceSequenceLength, includeAudio: false)
       return (main: mainCount * batchSize, fixed: fixedCount)
     case .v1:
       let mainCount = UNetInstructionCount(
@@ -611,6 +631,7 @@ public enum ComputeUnits {
     _ configuration: GenerationConfiguration,
     context: ResolvedModelContext,
     hasImage: Bool,
+    imageFrames: Int,
     shuffleCount: Int,
     includesModelUsageBias: Bool
   ) -> Int {
@@ -618,7 +639,8 @@ public enum ComputeUnits {
       includesModelUsageBias ? modelUsageBiasMultiplier(for: context.modelVersion) : 1
     if context.modelVersion == .wurstchenStageC {
       let firstPassCounts = instructionCountFromResolvedModel(
-        configuration, context: context, hasImage: hasImage, shuffleCount: shuffleCount)
+        configuration, context: context, hasImage: hasImage, imageFrames: imageFrames,
+        shuffleCount: shuffleCount)
       let cfgChannels = cfgChannels(configuration: configuration, context: context)
       let (batchSize, _) = batchSizeAndNumFrames(
         configuration: configuration, context: context, cfgChannels: cfgChannels)
@@ -635,7 +657,8 @@ public enum ComputeUnits {
       return Int(min(Double(Int.max), biasedEstimate.rounded(.up)))
     }
     let instructionCounts = instructionCountFromResolvedModel(
-      configuration, context: context, hasImage: hasImage, shuffleCount: shuffleCount)
+      configuration, context: context, hasImage: hasImage, imageFrames: imageFrames,
+      shuffleCount: shuffleCount)
     let mainEstimate =
       Double(instructionCounts.main) * instructionCalibrationScale
       * Double(configuration.steps) * Double(max(configuration.strength, 0.05))
@@ -655,9 +678,11 @@ public enum ComputeUnits {
   }
 
   /// Leave out the model usage bias to estimate the work done rather than the price.
+  /// `imageFrames` is how many frames the canvas image holds: MiniMax H3 Ref2VA reads 22 or more
+  /// as a reference clip.
   public static func from(
     _ configuration: GenerationConfiguration,
-    hasImage: Bool, shuffleCount: Int,
+    hasImage: Bool, imageFrames: Int = 1, shuffleCount: Int,
     overrideMapping: (
       model: [String: ModelZoo.Specification], lora: [String: LoRAZoo.Specification]
     )? = nil,
@@ -669,8 +694,8 @@ public enum ComputeUnits {
       return nil
     }
     return from(
-      configuration, context: context, hasImage: hasImage, shuffleCount: shuffleCount,
-      includesModelUsageBias: includesModelUsageBias)
+      configuration, context: context, hasImage: hasImage, imageFrames: imageFrames,
+      shuffleCount: shuffleCount, includesModelUsageBias: includesModelUsageBias)
   }
 
   public static func threshold(for priority: String?) -> Int {

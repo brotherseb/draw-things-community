@@ -165,7 +165,7 @@ final class ComputeUnitsTests: XCTestCase {
       return 1.176470588 * 0.8
     case .seedvr2_7b:
       return 1.176470588
-    case .longcatVideoAvatar1_5, .minimaxH3:
+    case .longcatVideoAvatar1_5, .minimaxH3, .minimaxH3Image:
       fatalError()
     }
   }
@@ -222,7 +222,7 @@ final class ComputeUnitsTests: XCTestCase {
           lowerTriangle + upperRidge * Double(configuration.causalInference) / Double(numFrames)
         modelCoefficient = modelCoefficient * (totalArea / (sequenceLength * sequenceLength))
       }
-    case .longcatVideoAvatar1_5, .minimaxH3:
+    case .longcatVideoAvatar1_5, .minimaxH3, .minimaxH3Image:
       fatalError()
     }
     root = root * Double(numFrames)
@@ -405,6 +405,26 @@ final class ComputeUnitsTests: XCTestCase {
           configuration, hasImage: false, shuffleCount: 0, overrideMapping: overrideMapping))
       XCTAssertGreaterThan(estimate, 0)
     }
+  }
+
+  func testMiniMaxH3ReferenceClipCountsItsFrames() throws {
+    let modelName = "test-minimax-h3-reference-clip"
+    let specification = ModelZoo.Specification(
+      name: modelName, file: "test.ckpt", prefix: "test", version: .minimaxH3, modifier: .ref2va)
+    let cfg = configuration(modelName: modelName, width: 14, height: 8, numFrames: 56)
+    func estimate(imageFrames: Int, shuffleCount: Int) throws -> Int {
+      return try XCTUnwrap(
+        ComputeUnits.from(
+          cfg, hasImage: true, imageFrames: imageFrames, shuffleCount: shuffleCount,
+          overrideMapping: (model: [modelName: specification], lora: [:])))
+    }
+    // Fewer than 22 frames on the canvas are a picture: one reference.
+    XCTAssertEqual(
+      try estimate(imageFrames: 21, shuffleCount: 2), try estimate(imageFrames: 1, shuffleCount: 2))
+    // 56 frames are 17 latent frames, as long as a picture and 16 more on the Moodboard.
+    XCTAssertEqual(
+      try estimate(imageFrames: 56, shuffleCount: 2),
+      try estimate(imageFrames: 1, shuffleCount: 18))
   }
 
   func testMiniMaxH3FrameAlignmentMatchesGeneration() throws {
