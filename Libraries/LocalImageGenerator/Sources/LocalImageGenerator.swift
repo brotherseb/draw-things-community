@@ -4881,11 +4881,6 @@ extension LocalImageGenerator {
         ltxAudioReference = reference
       }
       let ltxReferenceAudios = ltxAudioReference.map { [$0] } ?? []
-      // LTX color stabilization (prototype): off unless the CLI's --ltx-color-match sets
-      // DRAWTHINGS_LTX_COLOR_MATCH. See LTXLatentColorMatch.swift.
-      let ltxColorMatch: LTXColorMatchSettings? =
-        (modelVersion == .ltx2 || modelVersion == .ltx2_3)
-        ? LTXColorMatchSettings.fromEnvironment() : nil
       // LTX-2.3 IC-LoRA guide (pose video): a multi-frame pose hint, [frames, height, width, 3], at
       // the first-pass size divided by the LoRA's reference downscale factor. Encoded with the
       // video VAE and passed after the first-frame reference; the transformer appends its tokens
@@ -4973,11 +4968,6 @@ extension LocalImageGenerator {
       x = applyImageCond(
         x, modifier: modifier, version: modelVersion, imageCond: firstPassImageCond)
       x = withLTXAudio(x, audioHeight: firstPassAudioHeight)
-      if let ltxColorMatch {
-        x = LTXLatentColorMatch(
-          x, reference: firstPassImageCond.1.first, videoHeight: firstPassStartHeight,
-          settings: ltxColorMatch)
-      }
       if modelVersion == .longcatVideoAvatar1_5, videoContinuationFrames != nil {
         let shape = x.shape
         x = x[1..<shape[0], 0..<shape[1], 0..<shape[2], 0..<shape[3]].copied()
@@ -5487,11 +5477,6 @@ extension LocalImageGenerator {
       x = applyImageCond(
         x, modifier: modifier, version: modelVersion, imageCond: secondPassImageCond)
       x = withLTXAudio(x, audioHeight: audioHeight)
-      if let ltxColorMatch {
-        x = LTXLatentColorMatch(
-          x, reference: secondPassImageCond.1.first, videoHeight: startHeight,
-          settings: ltxColorMatch)
-      }
       if modelVersion == .v2 || modelVersion == .sdxlBase || modelVersion == .sdxlRefiner
         || modelVersion == .ssd1b || modelVersion == .wurstchenStageC || modelVersion == .sd3
         || modelVersion == .pixart

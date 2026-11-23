@@ -595,21 +595,16 @@ struct GenerateImageInputOptions: ParsableArguments {
   var audioStartTime: Double = 0
 
   @Option(
-    name: .customLong("ltx-color-match"),
+    name: .customLong("ltx-decode-depth"),
     help:
-      "LTX color stabilization of the video latents: off (default), first (match every frame to the first frame, Lightricks' AdaIN) or smooth (shift the mean color of every frame towards the moving average of its neighbours, texture untouched: evens out short jumps, keeps slow lighting changes).")
-  var ltxColorMatch: String = "off"
+      "LTX: latent frames per temporal tile of the video VAE decoder (default 11 on high-memory Macs, 9 otherwise). Larger tiles mean fewer tile boundaries and more memory.")
+  var ltxDecodeDepth: Int?
 
   @Option(
-    name: .customLong("ltx-color-match-strength"),
-    help: "LTX color stabilization strength, from 0 (none) to 1 (full). Default 1.")
-  var ltxColorMatchStrength: Float = 1
-
-  @Option(
-    name: .customLong("ltx-color-match-radius"),
+    name: .customLong("ltx-decode-lookback"),
     help:
-      "LTX smooth color stabilization: latent frames averaged on each side (1 latent frame = 8 video frames). Default 2.")
-  var ltxColorMatchRadius: Int = 2
+      "LTX: latent frames of past context decoded before each temporal tile and dropped (default 1). The causal decoder darkens the start of a tile that lacks context; more lookback hides the jump at each tile boundary.")
+  var ltxDecodeLookback: Int?
 
   @Option(
     name: .customLong("control-video"),
@@ -4817,21 +4812,21 @@ extension DrawThingsCLI {
             videoFrames: videoFrames, framesPerSecond: fps)
         }
       }
-      switch imageInput.ltxColorMatch {
-      case "off":
-        unsetenv("DRAWTHINGS_LTX_COLOR_MATCH")
-      case "first", "smooth":
-        // Prototype plumbing: read by LocalImageGenerator for LTX models.
-        setenv(
-          "DRAWTHINGS_LTX_COLOR_MATCH",
-          "\(imageInput.ltxColorMatch):\(imageInput.ltxColorMatchStrength):\(imageInput.ltxColorMatchRadius)",
-          1)
+      // Prototype plumbing: read by FirstStage for LTX models.
+      if let depth = imageInput.ltxDecodeDepth {
+        guard depth >= 2 else { throw ValidationError("--ltx-decode-depth must be at least 2.") }
+        setenv("DRAWTHINGS_LTX_DECODE_DEPTH", String(depth), 1)
+      }
+      if let lookback = imageInput.ltxDecodeLookback {
+        guard lookback >= 0 else {
+          throw ValidationError("--ltx-decode-lookback must be 0 or more.")
+        }
+        setenv("DRAWTHINGS_LTX_DECODE_LOOKBACK", String(lookback), 1)
+      }
+      if imageInput.ltxDecodeDepth != nil || imageInput.ltxDecodeLookback != nil {
         context.print(
-          imageInput.ltxColorMatch == "smooth"
-            ? "LTX color match: smooth, strength \(imageInput.ltxColorMatchStrength), radius \(imageInput.ltxColorMatchRadius) latent frames"
-            : "LTX color match: first frame, strength \(imageInput.ltxColorMatchStrength)")
-      default:
-        throw ValidationError("--ltx-color-match must be off, first or smooth.")
+          "LTX decode tiles: depth \(imageInput.ltxDecodeDepth.map(String.init) ?? "default"), lookback \(imageInput.ltxDecodeLookback.map(String.init) ?? "default")"
+        )
       }
       let runner = try LocalGenerationRunner(context: context)
       let livePreviewSession: TerminalImageRenderer.LivePreviewSession?

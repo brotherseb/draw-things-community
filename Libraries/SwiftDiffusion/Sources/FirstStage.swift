@@ -1,4 +1,5 @@
 import Atomics
+import Foundation
 import Dispatch
 import NNC
 
@@ -897,8 +898,13 @@ extension FirstStage {
       outputChannels = 3
       causalAttentionMask = nil
     case .ltx2, .ltx2_3:
+      // Prototype overrides (fork): DRAWTHINGS_LTX_DECODE_LOOKBACK / _DEPTH, set by the CLI's
+      // --ltx-decode-lookback / --ltx-decode-depth.
+      let environment = ProcessInfo.processInfo.environment
+      let ltxDecodeLookback = environment["DRAWTHINGS_LTX_DECODE_LOOKBACK"].flatMap { Int($0) }
+      let ltxDecodeDepth = environment["DRAWTHINGS_LTX_DECODE_DEPTH"].flatMap { Int($0) }
       temporalTiledDecodingConfiguration = TemporalTiledDecodingConfiguration(
-        overlap: 3, lookback: 1)
+        overlap: 3, lookback: max(0, ltxDecodeLookback ?? 1))
       var startDepth = shape[0]
       var startWidth = tiledDecoding ? decodingTileSize.width : startWidth
       var startHeight = tiledDecoding ? decodingTileSize.height : startHeight
@@ -963,6 +969,9 @@ extension FirstStage {
       case .low:
         sizeLimit = 12
         decodingTileSize.depth = 9
+      }
+      if let ltxDecodeDepth {
+        decodingTileSize.depth = max(2, ltxDecodeDepth)
       }
       if startWidth > sizeLimit || startHeight > sizeLimit || startDepth > decodingTileSize.depth {
         // We turn on tiled decoding forcefully.
