@@ -2554,6 +2554,13 @@ extension FirstStage {
     }
     let temporalTileCount =
       batchSize <= nominalDepth ? 1 : ((batchSize - nominalDepth) + tileStep - 1) / tileStep + 1
+    // Sum of the temporal blending weights each output frame received. The left fade of a tile
+    // and the right fade of the previous one do not cover exactly the same frames (with a
+    // lookback they even differ in length), so the weights of a frame can add up to more than 1.
+    // The decoded values are in [-1, 1]: an excess of weight scales them away from 0, which shows
+    // in a mostly dark scene as a sudden darkening at each tile boundary that fades out over the
+    // overlap. Every frame is divided by its weight sum once all tiles are blended.
+    var temporalWeightSums = [Float](repeating: 0, count: resultBatchSize)
     for tileIndex in 0..<temporalTileCount {
       let anchor = tileIndex * tileStep
       var decodedRawValues = [Tensor<T>]()
@@ -2575,6 +2582,25 @@ extension FirstStage {
         tileDecodedEnd = min(tileDecodedEnd, firstTileValidFrames)
       }
       guard tDecodedStart < tileDecodedEnd else { break }  // Nothing to copy, break.
+      func temporalWeight(_ tDecoded: Int) -> Float {
+        if tileIndex > 0 && tDecoded - tDecodedStart < leftFadeFrames && leftFadeFrames > 0 {
+          return min((Float(tDecoded - tDecodedStart) + fadeOffset) / Float(leftFadeFrames), 1)
+        } else if tileDecodedEnd - tDecoded <= rightFadeFrames && !isLast && rightFadeFrames > 0 {
+          return min((Float(tileDecodedEnd - tDecoded) - fadeOffset) / Float(rightFadeFrames), 1)
+        }
+        return 1
+      }
+      for tDecoded in tDecodedStart..<tileDecodedEnd {
+        var tOutput = tDecoded + tStart * scaleFactor.temporal
+        if let frameDrop {
+          let offset = tOutput % frameDrop.interval
+          guard offset < frameDrop.interval - frameDrop.count else { continue }
+          tOutput -= tOutput / frameDrop.interval * frameDrop.count
+        }
+        if tOutput < resultBatchSize {
+          temporalWeightSums[tOutput] += temporalWeight(tDecoded)
+        }
+      }
       for y in 0..<yTiles {
         let yOfs = y * (tileSize.height - tileOverlap * 2) + (y > 0 ? tileOverlap : 0)
         let (inputStartYPad, inputEndYPad) = paddedTileStartAndEnd(
@@ -2628,17 +2654,7 @@ extension FirstStage {
               }
               return v
             }
-            let tWeight: Float
-            if tileIndex > 0 && tDecoded - tDecodedStart < leftFadeFrames && leftFadeFrames > 0 {
-              tWeight = min(
-                (Float(tDecoded - tDecodedStart) + fadeOffset) / Float(leftFadeFrames), 1)
-            } else if tileDecodedEnd - tDecoded <= rightFadeFrames && !isLast && rightFadeFrames > 0
-            {
-              tWeight = min(
-                (Float(tileDecodedEnd - tDecoded) - fadeOffset) / Float(rightFadeFrames), 1)
-            } else {
-              tWeight = 1
-            }
+            let tWeight = temporalWeight(tDecoded)
             for j in 0..<(shape[1] * scaleFactor.spatial) {
               let yWeightAndIndex = yWeightsAndIndexes[j]
               for i in 0..<(shape[2] * scaleFactor.spatial) {
@@ -2661,6 +2677,18 @@ extension FirstStage {
               }
             }
           }
+        }
+      }
+    }
+    let framePixels =
+      shape[1] * scaleFactor.spatial * shape[2] * scaleFactor.spatial * outputChannels
+    result.withUnsafeMutableBytes {
+      guard let rfp = $0.baseAddress?.assumingMemoryBound(to: T.self) else { return }
+      for (t, sum) in temporalWeightSums.enumerated() where sum > 0 && abs(sum - 1) > 1e-4 {
+        let scale = T(1 / sum)
+        let fp = rfp + t * framePixels
+        for i in 0..<framePixels {
+          fp[i] = fp[i] * scale
         }
       }
     }
