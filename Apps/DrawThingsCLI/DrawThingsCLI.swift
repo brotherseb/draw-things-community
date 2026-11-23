@@ -595,6 +595,23 @@ struct GenerateImageInputOptions: ParsableArguments {
   var audioStartTime: Double = 0
 
   @Option(
+    name: .customLong("ltx-color-match"),
+    help:
+      "LTX color stabilization of the video latents: off (default), first (match every frame to the first frame, Lightricks' AdaIN) or smooth (match every frame to the moving average of its neighbours: evens out short jumps, keeps slow lighting changes).")
+  var ltxColorMatch: String = "off"
+
+  @Option(
+    name: .customLong("ltx-color-match-strength"),
+    help: "LTX color stabilization strength, from 0 (none) to 1 (full). Default 1.")
+  var ltxColorMatchStrength: Float = 1
+
+  @Option(
+    name: .customLong("ltx-color-match-radius"),
+    help:
+      "LTX smooth color stabilization: latent frames averaged on each side (1 latent frame = 8 video frames). Default 2.")
+  var ltxColorMatchRadius: Int = 2
+
+  @Option(
     name: .customLong("control-video"),
     help:
       "LTX-2.3 IC-LoRA guide video (e.g. a pose skeleton), read from its first frame at the clip's frame rate. Load the IC-LoRA itself in --config-json loras. Needs a first-frame --image.")
@@ -4799,6 +4816,22 @@ extension DrawThingsCLI {
           fallbackAudio = audioInput.waveformTensor(
             videoFrames: videoFrames, framesPerSecond: fps)
         }
+      }
+      switch imageInput.ltxColorMatch {
+      case "off":
+        unsetenv("DRAWTHINGS_LTX_COLOR_MATCH")
+      case "first", "smooth":
+        // Prototype plumbing: read by LocalImageGenerator for LTX models.
+        setenv(
+          "DRAWTHINGS_LTX_COLOR_MATCH",
+          "\(imageInput.ltxColorMatch):\(imageInput.ltxColorMatchStrength):\(imageInput.ltxColorMatchRadius)",
+          1)
+        context.print(
+          imageInput.ltxColorMatch == "smooth"
+            ? "LTX color match: smooth, strength \(imageInput.ltxColorMatchStrength), radius \(imageInput.ltxColorMatchRadius) latent frames"
+            : "LTX color match: first frame, strength \(imageInput.ltxColorMatchStrength)")
+      default:
+        throw ValidationError("--ltx-color-match must be off, first or smooth.")
       }
       let runner = try LocalGenerationRunner(context: context)
       let livePreviewSession: TerminalImageRenderer.LivePreviewSession?
