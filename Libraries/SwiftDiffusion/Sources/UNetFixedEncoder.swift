@@ -785,7 +785,7 @@ extension UNetFixedEncoder {
       precondition(fixedConditions.count == 1 + 6 + 1)
       // Krea 2 edit (fork prototype): reference latents, each brought to the target latent size,
       // stacked under the target; RoPE frames 1...N (the boost is applied in the attention).
-      if !referenceImages.isEmpty, let edit = Krea2EditSettings.fromEnvironment() {
+      if !referenceImages.isEmpty, let edit = Krea2EditSettings.current {
         let references = referenceImages.map { reference -> DynamicGraph.Tensor<FloatType> in
           let shape = reference.shape
           guard shape[1] != startHeight || shape[2] != startWidth else { return reference }

@@ -3527,11 +3527,11 @@ extension LocalImageGenerator {
     modifier: SamplerModifier, version: ModelVersion, firstStage: FirstStage<FloatType>,
     usesFlashAttention: Bool
   ) -> (DynamicGraph.Tensor<FloatType>?, [DynamicGraph.Tensor<FloatType>]) {
-    // Krea 2 edit (fork prototype, DRAWTHINGS_KREA2_EDIT set by the CLI): the canvas and the
+    // Krea 2 edit (Krea2EditSettings.current set, by the CLI with --krea2-edit): the canvas and the
     // moodboard images become the in-context references, in order (scene first, subject last).
     // Each is center-cropped to the output aspect ratio and resized to the output size, then
     // VAE-encoded, as ComfyUI-Krea2Edit does for a near-matching aspect ratio.
-    if version == .krea2, Krea2EditSettings.fromEnvironment() != nil {
+    if version == .krea2, Krea2EditSettings.current != nil {
       let images =
         (image.map { [$0] } ?? [])
         + shuffles.filter { $0.1 > 0 }.map { graph.variable($0.0.toGPU(0)) }
@@ -4701,7 +4701,7 @@ extension LocalImageGenerator {
         || modifier == .qwenimageEditPlus || modifier == .qwenimageEdit2511
         || modifier == .qwenimageLayered || canInjectControls
         || canInjectT2IAdapters || !injectIPAdapterLengths.isEmpty
-        || (modelVersion == .krea2 && Krea2EditSettings.fromEnvironment() != nil)
+        || (modelVersion == .krea2 && Krea2EditSettings.current != nil)
       {
         // TODO: This needs to be properly handled for Wurstchen (i.e. using EfficientNet to encode image).
         firstPassImage =

@@ -8,23 +8,28 @@ import NNC
 /// out. `boost` multiplies the target-to-reference attention weight, done exactly (for whole
 /// numbers) by repeating that reference's keys and values for the target queries only, the same
 /// as adding log(boost) to their logits; `beside` moves a reference to the right of the canvas on the width axis instead of
-/// pinning it onto the target layout. Set by the CLI through DRAWTHINGS_KREA2_EDIT as
-/// "boost:boostA:position:positionA" (the A values apply to every reference but the last).
-public struct Krea2EditSettings {
+/// pinning it onto the target layout. The values without A apply to the last reference (the
+/// subject), the A values to every other one (the scene). The defaults are the trained behavior:
+/// every reference aligned, no boost.
+///
+/// Edit mode is on while `Krea2EditSettings.current` is set (the CLI sets it for one generation
+/// with --krea2-edit). A process-wide value rather than a configuration field: the generation
+/// configuration is a FlatBuffers schema, whose new fields belong to the maintainers.
+public struct Krea2EditSettings: Equatable {
   public var boost: Float
   public var boostA: Float
   public var beside: Bool
   public var besideA: Bool
 
-  public static func fromEnvironment() -> Krea2EditSettings? {
-    guard let value = ProcessInfo.processInfo.environment["DRAWTHINGS_KREA2_EDIT"] else {
-      return nil
-    }
-    let parts = value.split(separator: ":", omittingEmptySubsequences: false).map(String.init)
-    func float(_ i: Int) -> Float { i < parts.count ? (Float(parts[i]) ?? 1) : 1 }
-    func beside(_ i: Int) -> Bool { i < parts.count && parts[i] == "beside" }
-    return Krea2EditSettings(boost: float(0), boostA: float(1), beside: beside(2), besideA: beside(3))
+  public init(boost: Float = 1, boostA: Float = 1, beside: Bool = false, besideA: Bool = false) {
+    self.boost = boost
+    self.boostA = boostA
+    self.beside = beside
+    self.besideA = besideA
   }
+
+  /// The settings of the generation in progress, or nil when Krea 2 edit is off.
+  public static var current: Krea2EditSettings? = nil
 
   /// RoPE (frame, y offset, x offset) of each reference, in order.
   public func referencePositions(count: Int, gridWidth: Int) -> [(frame: Int, xOffset: Int)] {
@@ -45,9 +50,9 @@ public struct Krea2EditSettings {
 }
 
 /// Whole-number repeats of each reference for the boosted attention (1 = no boost), from the
-/// CLI settings; a fractional boost is rounded.
+/// current settings; a fractional boost is rounded.
 public func Krea2EditReferenceRepeats(referenceCount: Int) -> [Int] {
-  guard referenceCount > 0, let edit = Krea2EditSettings.fromEnvironment() else { return [] }
+  guard referenceCount > 0, let edit = Krea2EditSettings.current else { return [] }
   return edit.referenceBoosts(count: referenceCount).map { max(1, Int($0.rounded())) }
 }
 

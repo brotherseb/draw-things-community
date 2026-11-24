@@ -4652,6 +4652,22 @@ extension DrawThingsCLI {
       defer {
         LoRAZoo.overrideMapping = [:]
       }
+      // The generator drops a LoRA whose version is not the model's without a word, which looks
+      // like a LoRA with no effect: most often a local LoRA neither registered in custom_lora.json
+      // nor given a version here (its version then defaults to SD 1.x).
+      if configuration.refinerModel == nil {
+        for file in configuration.loras.compactMap({ $0.file }) {
+          if LoRAZoo.specificationForModel(file) == nil {
+            context.write(
+              "Warning: LoRA \(file) is not registered in custom_lora.json and has no version in --config-json loras, so it will be ignored. Add \"version\": \"\(modelSpecification.version.rawValue)\" to its entry.\n",
+              to: .standardError)
+          } else if LoRAZoo.versionForModel(file) != modelSpecification.version {
+            context.write(
+              "Warning: LoRA \(file) is for \(LoRAZoo.versionForModel(file).rawValue), not \(modelSpecification.version.rawValue), so it will be ignored.\n",
+              to: .standardError)
+          }
+        }
+      }
 
       // Resolve the host default for this invocation before downloading local weights.
       // Explicit backends and local-only requests never consult the account.
@@ -4840,21 +4856,51 @@ extension DrawThingsCLI {
             videoFrames: videoFrames, framesPerSecond: fps)
         }
       }
-      // Prototype plumbing: read by LocalImageGenerator and UNetFixedEncoder for Krea 2.
+      // Krea 2 edit: read by LocalImageGenerator, UNetFixedEncoder and the Krea 2 model builder.
       if imageInput.krea2Edit {
-        for position in [imageInput.krea2RefPosition, imageInput.krea2RefPositionA]
-        where position != "aligned" && position != "beside" {
-          throw ValidationError("--krea2-ref-position must be aligned or beside, not \(position).")
+        guard modelSpecification.version == .krea2 else {
+          throw ValidationError("--krea2-edit needs a Krea 2 model.")
         }
-        setenv(
-          "DRAWTHINGS_KREA2_EDIT",
-          "\(imageInput.krea2RefBoost):\(imageInput.krea2RefBoostA):\(imageInput.krea2RefPosition):\(imageInput.krea2RefPositionA)",
-          1)
+        func isBeside(_ position: String, _ option: String) throws -> Bool {
+          switch position {
+          case "aligned": return false
+          case "beside": return true
+          default:
+            throw ValidationError("\(option) must be aligned or beside, not \(position).")
+          }
+        }
+        for (boost, option) in [
+          (imageInput.krea2RefBoost, "--krea2-ref-boost"),
+          (imageInput.krea2RefBoostA, "--krea2-ref-boost-a"),
+        ] where !(boost >= 1) {
+          throw ValidationError("\(option) must be 1 or more, not \(boost).")
+        }
+        let settings = Krea2EditSettings(
+          boost: imageInput.krea2RefBoost, boostA: imageInput.krea2RefBoostA,
+          beside: try isBeside(imageInput.krea2RefPosition, "--krea2-ref-position"),
+          besideA: try isBeside(imageInput.krea2RefPositionA, "--krea2-ref-position-a"))
+        if configuration.loras.isEmpty {
+          context.write(
+            "Warning: --krea2-edit without a LoRA: the base model was not trained for in-context references. Load an Identity Edit LoRA in --config-json loras.\n",
+            to: .standardError)
+        }
+        for (boost, option) in [
+          (imageInput.krea2RefBoost, "--krea2-ref-boost"),
+          (imageInput.krea2RefBoostA, "--krea2-ref-boost-a"),
+        ] where boost.rounded() != boost {
+          context.write(
+            "Warning: \(option) \(boost) is rounded to \(Int(boost.rounded())) (whole numbers only).\n",
+            to: .standardError)
+        }
+        Krea2EditSettings.current = settings
         context.print(
-          "Krea 2 edit: ref boost \(imageInput.krea2RefBoost) (others \(imageInput.krea2RefBoostA)), position \(imageInput.krea2RefPosition) (others \(imageInput.krea2RefPositionA))"
+          "Krea 2 edit: ref boost \(Int(settings.boost.rounded())) (others \(Int(settings.boostA.rounded()))), position \(imageInput.krea2RefPosition) (others \(imageInput.krea2RefPositionA))"
         )
       } else {
-        unsetenv("DRAWTHINGS_KREA2_EDIT")
+        Krea2EditSettings.current = nil
+      }
+      defer {
+        Krea2EditSettings.current = nil
       }
       // Prototype plumbing: read by FirstStage for LTX models.
       if let depth = imageInput.ltxDecodeDepth {
