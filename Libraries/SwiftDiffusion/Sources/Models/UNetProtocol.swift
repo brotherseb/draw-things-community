@@ -225,8 +225,11 @@ public func UNetExtractConditions<FloatType: TensorNumeric & BinaryFloatingPoint
     }
     return extracted
   case .krea2:
+    // Text and rotary, then the 6 modulations and the time embedding (one row per timestep),
+    // then the Krea 2 edit references and attention bias, which are not per timestep.
+    let timeEnd = min(conditions.count, 2 + 7)
     return Array(conditions[0..<2])
-      + conditions[2..<conditions.count].map {
+      + conditions[2..<timeEnd].map {
         let shape = $0.shape
         if shape.count == 2 {
           return DynamicGraph.Tensor<FloatType>($0)[
@@ -237,6 +240,7 @@ public func UNetExtractConditions<FloatType: TensorNumeric & BinaryFloatingPoint
           index..<(index + 1), 0..<shape[1], 0..<shape[2]
         ].copied()
       }
+      + Array(conditions[timeEnd...])
   case .sd3, .auraflow, .sd3Large:
     return [conditions[0]]
       + conditions[1..<conditions.count].map {

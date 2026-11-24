@@ -4701,6 +4701,7 @@ extension LocalImageGenerator {
         || modifier == .qwenimageEditPlus || modifier == .qwenimageEdit2511
         || modifier == .qwenimageLayered || canInjectControls
         || canInjectT2IAdapters || !injectIPAdapterLengths.isEmpty
+        || (modelVersion == .krea2 && Krea2EditSettings.fromEnvironment() != nil)
       {
         // TODO: This needs to be properly handled for Wurstchen (i.e. using EfficientNet to encode image).
         firstPassImage =
