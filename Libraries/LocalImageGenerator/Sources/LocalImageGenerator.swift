@@ -3527,6 +3527,42 @@ extension LocalImageGenerator {
     modifier: SamplerModifier, version: ModelVersion, firstStage: FirstStage<FloatType>,
     usesFlashAttention: Bool
   ) -> (DynamicGraph.Tensor<FloatType>?, [DynamicGraph.Tensor<FloatType>]) {
+    // Krea 2 edit (fork prototype, DRAWTHINGS_KREA2_EDIT set by the CLI): the canvas and the
+    // moodboard images become the in-context references, in order (scene first, subject last).
+    // Each is center-cropped to the output aspect ratio and resized to the output size, then
+    // VAE-encoded, as ComfyUI-Krea2Edit does for a near-matching aspect ratio.
+    if version == .krea2, Krea2EditSettings.fromEnvironment() != nil {
+      let images =
+        (image.map { [$0] } ?? [])
+        + shuffles.filter { $0.1 > 0 }.map { graph.variable($0.0.toGPU(0)) }
+      let targetHeight = startHeight * 8
+      let targetWidth = startWidth * 8
+      let encoded = images.map { source -> DynamicGraph.Tensor<FloatType> in
+        let shape = source.shape
+        var height = shape[1]
+        var width = shape[2]
+        var image = source[0..<1, 0..<height, 0..<width, 0..<3].copied()
+        let scale = max(Double(targetHeight) / Double(height), Double(targetWidth) / Double(width))
+        let cropHeight = min(height, Int((Double(targetHeight) / scale).rounded()))
+        let cropWidth = min(width, Int((Double(targetWidth) / scale).rounded()))
+        if cropHeight != height || cropWidth != width {
+          let y0 = (height - cropHeight) / 2
+          let x0 = (width - cropWidth) / 2
+          image = image[0..<1, y0..<(y0 + cropHeight), x0..<(x0 + cropWidth), 0..<3].copied()
+          height = cropHeight
+          width = cropWidth
+        }
+        if height != targetHeight || width != targetWidth {
+          image = Upsample(
+            .bilinear, widthScale: Float(targetWidth) / Float(width),
+            heightScale: Float(targetHeight) / Float(height))(image)
+        }
+        let moments = firstStage.encode(image, encoder: nil, cancellation: { _ in }).0
+        return firstStage.scale(
+          moments[0..<1, 0..<moments.shape[1], 0..<moments.shape[2], 0..<16].copied())
+      }
+      return (nil, encoded)
+    }
     switch modifier {
     case .depth:
       guard

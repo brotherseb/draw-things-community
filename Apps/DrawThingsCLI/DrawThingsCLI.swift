@@ -594,6 +594,34 @@ struct GenerateImageInputOptions: ParsableArguments {
     help: "LTX-2.3 audio-to-video: start of the audio segment, in seconds.")
   var audioStartTime: Double = 0
 
+  @Flag(
+    name: .customLong("krea2-edit"),
+    help:
+      "Krea 2 in-context edit (load an Identity Edit LoRA in --config-json): the --image files become the references, in order: the scene first, the subject last. Pass --crop and --strength 1.")
+  var krea2Edit = false
+
+  @Option(
+    name: .customLong("krea2-ref-boost"),
+    help:
+      "Krea 2 edit: reference-fidelity dial for the last reference (the subject): multiplies the target-to-reference attention. 1 = off.")
+  var krea2RefBoost: Float = 1
+
+  @Option(
+    name: .customLong("krea2-ref-boost-a"),
+    help: "Krea 2 edit: the same dial for the other references (the scene). 1 = off.")
+  var krea2RefBoostA: Float = 1
+
+  @Option(
+    name: .customLong("krea2-ref-position"),
+    help:
+      "Krea 2 edit: aligned (default, pinned onto the output layout, as trained) or beside (next to the canvas: the person can be restaged more freely) for the last reference.")
+  var krea2RefPosition: String = "aligned"
+
+  @Option(
+    name: .customLong("krea2-ref-position-a"),
+    help: "Krea 2 edit: aligned or beside for the other references.")
+  var krea2RefPositionA: String = "aligned"
+
   @Option(
     name: .customLong("ltx-decode-depth"),
     help:
@@ -4811,6 +4839,22 @@ extension DrawThingsCLI {
           fallbackAudio = audioInput.waveformTensor(
             videoFrames: videoFrames, framesPerSecond: fps)
         }
+      }
+      // Prototype plumbing: read by LocalImageGenerator and UNetFixedEncoder for Krea 2.
+      if imageInput.krea2Edit {
+        for position in [imageInput.krea2RefPosition, imageInput.krea2RefPositionA]
+        where position != "aligned" && position != "beside" {
+          throw ValidationError("--krea2-ref-position must be aligned or beside, not \(position).")
+        }
+        setenv(
+          "DRAWTHINGS_KREA2_EDIT",
+          "\(imageInput.krea2RefBoost):\(imageInput.krea2RefBoostA):\(imageInput.krea2RefPosition):\(imageInput.krea2RefPositionA)",
+          1)
+        context.print(
+          "Krea 2 edit: ref boost \(imageInput.krea2RefBoost) (others \(imageInput.krea2RefBoostA)), position \(imageInput.krea2RefPosition) (others \(imageInput.krea2RefPositionA))"
+        )
+      } else {
+        unsetenv("DRAWTHINGS_KREA2_EDIT")
       }
       // Prototype plumbing: read by FirstStage for LTX models.
       if let depth = imageInput.ltxDecodeDepth {

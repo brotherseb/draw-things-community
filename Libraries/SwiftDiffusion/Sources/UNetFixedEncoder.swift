@@ -782,11 +782,52 @@ extension UNetFixedEncoder {
         weightsCache.attach("\(filePath):[fixed]", from: unetFixed.parameters)
       }
       let maxTextLength = isCfgEnabled ? max(tokenLengthUncond, tokenLengthCond) : tokenLengthCond
+      precondition(fixedConditions.count == 1 + 6 + 1)
+      // Krea 2 edit (fork prototype): reference latents, each brought to the target latent size,
+      // stacked under the target; RoPE frames 1...N; optional target-to-reference attention bias.
+      if !referenceImages.isEmpty, let edit = Krea2EditSettings.fromEnvironment() {
+        let references = referenceImages.map { reference -> DynamicGraph.Tensor<FloatType> in
+          let shape = reference.shape
+          guard shape[1] != startHeight || shape[2] != startWidth else { return reference }
+          print(
+            "Krea 2 edit: reference latent \(shape[1])x\(shape[2]) resized to the target \(startHeight)x\(startWidth); pass --crop for the trained geometry."
+          )
+          return Upsample(
+            .bilinear, widthScale: Float(startWidth) / Float(shape[2]),
+            heightScale: Float(startHeight) / Float(shape[1]))(reference)
+        }
+        var stacked = graph.variable(
+          .GPU(0), .NHWC(1, startHeight * references.count, startWidth, 16), of: FloatType.self)
+        for (index, reference) in references.enumerated() {
+          stacked[
+            0..<1, (index * startHeight)..<((index + 1) * startHeight), 0..<startWidth, 0..<16] =
+            reference[0..<1, 0..<startHeight, 0..<startWidth, 0..<16]
+        }
+        let positions = edit.referencePositions(count: references.count, gridWidth: w)
+        let rotary = graph.variable(
+          Krea2RotaryPositionEmbedding(
+            textLength: maxTextLength, gridHeight: h, gridWidth: w, references: positions,
+            of: FloatType.self
+          ).toGPU(0))
+        let boosts = edit.referenceBoosts(count: references.count)
+        var outputs: [DynamicGraph.AnyTensor] =
+          [fixedConditions[0], rotary] + Array(fixedConditions[1...]) + [stacked]
+        if boosts.contains(where: { $0 != 1 }) {
+          outputs.append(
+            graph.variable(
+              Krea2EditAttentionBias(
+                imageLength: h * w, boosts: boosts, textLength: maxTextLength, of: FloatType.self
+              ).toGPU(0)))
+        }
+        print(
+          "Krea 2 edit: \(references.count) reference(s), boost \(boosts), positions \(positions.map { $0.xOffset == 0 ? "aligned" : "beside" })"
+        )
+        return (outputs, nil)
+      }
       let rotary = graph.variable(
         Krea2RotaryPositionEmbedding(
           textLength: maxTextLength, gridHeight: h, gridWidth: w, of: FloatType.self
         ).toGPU(0))
-      precondition(fixedConditions.count == 1 + 6 + 1)
       return ([fixedConditions[0], rotary] + Array(fixedConditions[1...]), nil)
     case .sdxlBase, .ssd1b:
       let batchSize = textEncoding[0].shape[0]

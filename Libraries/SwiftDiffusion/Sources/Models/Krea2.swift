@@ -1,43 +1,111 @@
 import Foundation
 import NNC
 
+/// Krea 2 in-context edit (fork prototype), for the community Identity Edit LoRAs (conradlocke,
+/// ComfyUI-Krea2Edit). Each reference image is VAE-encoded at the target size and its tokens are
+/// placed after the target tokens, told apart only by the frame axis of the 3-axis RoPE
+/// (target 0, references 1...N in order: scene first, subject last). Only the target tokens come
+/// out. `boost` multiplies the target-to-reference attention (an additive log bias on the
+/// logits), `beside` moves a reference to the right of the canvas on the width axis instead of
+/// pinning it onto the target layout. Set by the CLI through DRAWTHINGS_KREA2_EDIT as
+/// "boost:boostA:position:positionA" (the A values apply to every reference but the last).
+public struct Krea2EditSettings {
+  public var boost: Float
+  public var boostA: Float
+  public var beside: Bool
+  public var besideA: Bool
+
+  public static func fromEnvironment() -> Krea2EditSettings? {
+    guard let value = ProcessInfo.processInfo.environment["DRAWTHINGS_KREA2_EDIT"] else {
+      return nil
+    }
+    let parts = value.split(separator: ":", omittingEmptySubsequences: false).map(String.init)
+    func float(_ i: Int) -> Float { i < parts.count ? (Float(parts[i]) ?? 1) : 1 }
+    func beside(_ i: Int) -> Bool { i < parts.count && parts[i] == "beside" }
+    return Krea2EditSettings(boost: float(0), boostA: float(1), beside: beside(2), besideA: beside(3))
+  }
+
+  /// RoPE (frame, y offset, x offset) of each reference, in order.
+  public func referencePositions(count: Int, gridWidth: Int) -> [(frame: Int, xOffset: Int)] {
+    var x0 = gridWidth
+    return (0..<count).map { index in
+      let isLast = index == count - 1
+      if isLast ? beside : besideA {
+        defer { x0 += gridWidth }
+        return (frame: index + 1, xOffset: x0)
+      }
+      return (frame: index + 1, xOffset: 0)
+    }
+  }
+
+  public func referenceBoosts(count: Int) -> [Float] {
+    (0..<count).map { $0 == count - 1 ? boost : boostA }
+  }
+}
+
+/// Additive attention bias for the Krea 2 edit sequence [target | references | text]:
+/// log(boost) from every target query to the keys of each boosted reference, 0 elsewhere.
+/// `tokenLength` covers the longest text, the model slices its own length.
+public func Krea2EditAttentionBias<FloatType: TensorNumeric & BinaryFloatingPoint>(
+  imageLength: Int, boosts: [Float], textLength: Int, of dataType: FloatType.Type = FloatType.self
+) -> Tensor<FloatType> {
+  let tokenLength = imageLength * (1 + boosts.count) + textLength
+  var bias = Tensor<FloatType>(
+    Array(repeating: 0, count: tokenLength * tokenLength), .CPU,
+    .NHWC(1, 1, tokenLength, tokenLength))
+  bias.withUnsafeMutableBytes {
+    guard let fp = $0.baseAddress?.assumingMemoryBound(to: FloatType.self) else { return }
+    for (index, boost) in boosts.enumerated() where boost != 1 {
+      let value = FloatType(Foundation.log(Double(max(boost, 1e-4))))
+      let start = imageLength * (1 + index)
+      for row in 0..<imageLength {
+        let rowStart = fp + row * tokenLength
+        for column in start..<(start + imageLength) {
+          rowStart[column] = value
+        }
+      }
+    }
+  }
+  return bias
+}
+
 public func Krea2RotaryPositionEmbedding<FloatType: TensorNumeric & BinaryFloatingPoint>(
-  textLength: Int, gridHeight: Int, gridWidth: Int, of dataType: FloatType.Type = FloatType.self
+  textLength: Int, gridHeight: Int, gridWidth: Int,
+  references: [(frame: Int, xOffset: Int)] = [], of dataType: FloatType.Type = FloatType.self
 ) -> Tensor<FloatType> {
   let ropeTheta: Double = 1_000
   let imageLength = gridHeight * gridWidth
-  let tokenLength = imageLength + textLength
+  let mediaLength = imageLength * (1 + references.count)
+  let tokenLength = mediaLength + textLength
   var rotary = Tensor<FloatType>(.CPU, .NHWC(1, tokenLength, 1, 128))
   let dim0 = 32
   let dim1 = 48
   let dim2 = 48
-  for y in 0..<gridHeight {
-    for x in 0..<gridWidth {
-      let i = y * gridWidth + x
-      for k in 0..<(dim0 / 2) {
-        let theta = 0 * 1.0 / pow(ropeTheta, Double(k) * 2 / Double(dim0))
-        let sintheta = sin(theta)
-        let costheta = cos(theta)
-        rotary[0, i, 0, k * 2] = FloatType(costheta)
-        rotary[0, i, 0, k * 2 + 1] = FloatType(sintheta)
-      }
-      for k in 0..<(dim1 / 2) {
-        let theta = Double(y) * 1.0 / pow(ropeTheta, Double(k) * 2 / Double(dim1))
-        let sintheta = sin(theta)
-        let costheta = cos(theta)
-        rotary[0, i, 0, (k + (dim0 / 2)) * 2] = FloatType(costheta)
-        rotary[0, i, 0, (k + (dim0 / 2)) * 2 + 1] = FloatType(sintheta)
-      }
-      for k in 0..<(dim2 / 2) {
-        let theta = Double(x) * 1.0 / pow(ropeTheta, Double(k) * 2 / Double(dim2))
-        let sintheta = sin(theta)
-        let costheta = cos(theta)
-        rotary[0, i, 0, (k + (dim0 / 2) + (dim1 / 2)) * 2] = FloatType(costheta)
-        rotary[0, i, 0, (k + (dim0 / 2) + (dim1 / 2)) * 2 + 1] = FloatType(sintheta)
+  let images = [(frame: 0, xOffset: 0)] + references
+  for (index, image) in images.enumerated() {
+    for y in 0..<gridHeight {
+      for x in 0..<gridWidth {
+        let i = index * imageLength + y * gridWidth + x
+        for k in 0..<(dim0 / 2) {
+          let theta = Double(image.frame) * 1.0 / pow(ropeTheta, Double(k) * 2 / Double(dim0))
+          rotary[0, i, 0, k * 2] = FloatType(cos(theta))
+          rotary[0, i, 0, k * 2 + 1] = FloatType(sin(theta))
+        }
+        for k in 0..<(dim1 / 2) {
+          let theta = Double(y) * 1.0 / pow(ropeTheta, Double(k) * 2 / Double(dim1))
+          rotary[0, i, 0, (k + (dim0 / 2)) * 2] = FloatType(cos(theta))
+          rotary[0, i, 0, (k + (dim0 / 2)) * 2 + 1] = FloatType(sin(theta))
+        }
+        for k in 0..<(dim2 / 2) {
+          let theta =
+            Double(x + image.xOffset) * 1.0 / pow(ropeTheta, Double(k) * 2 / Double(dim2))
+          rotary[0, i, 0, (k + (dim0 / 2) + (dim1 / 2)) * 2] = FloatType(cos(theta))
+          rotary[0, i, 0, (k + (dim0 / 2) + (dim1 / 2)) * 2 + 1] = FloatType(sin(theta))
+        }
       }
     }
   }
-  let tokenOffset = imageLength
+  let tokenOffset = mediaLength
   for i in 0..<textLength {
     for k in 0..<(dim0 / 2) {
       let theta = 0 * 1.0 / pow(ropeTheta, Double(k) * 2 / Double(dim0))
@@ -126,13 +194,44 @@ private func Krea2ExplicitAttention(
   return out.reshaped([batchSize, queryLength, heads * headDim])
 }
 
+private func Krea2BiasedAttention(
+  queries: Model.IO, keys: Model.IO, values: Model.IO, bias: Model.IO, batchSize: Int,
+  queryLength: Int, keyValueLength: Int, heads: Int, keyValueHeads: Int, headDim: Int,
+  usesFlashAttention: FlashAttentionLevel
+) -> Model.IO {
+  guard usesFlashAttention != .none else {
+    let repeatedKeys = Krea2RepeatKeyValueHeads(
+      keys, batchSize: batchSize, tokenLength: keyValueLength, keyValueHeads: keyValueHeads,
+      heads: heads, headDim: headDim)
+    let repeatedValues = Krea2RepeatKeyValueHeads(
+      values, batchSize: batchSize, tokenLength: keyValueLength, keyValueHeads: keyValueHeads,
+      heads: heads, headDim: headDim)
+    let scaledQueries = ((1.0 / Float(headDim).squareRoot()) * queries).transposed(1, 2)
+      .contiguous()
+    let transposedKeys = repeatedKeys.transposed(1, 2).contiguous()
+    let transposedValues = repeatedValues.transposed(1, 2).contiguous()
+    var dot = Matmul(transposeB: (2, 3))(scaledQueries, transposedKeys) + bias
+    dot = dot.reshaped([batchSize * heads * queryLength, keyValueLength]).softmax()
+    dot = dot.reshaped([batchSize, heads, queryLength, keyValueLength])
+    var out = dot * transposedValues
+    out = out.reshaped([batchSize, heads, queryLength, headDim]).transposed(1, 2)
+    return out.reshaped([batchSize, queryLength, heads * headDim])
+  }
+  let scaledDotProductAttention = ScaledDotProductAttention(
+    scale: 1.0 / Float(headDim).squareRoot(), hasAttentionMask: true, flags: [.Float16])
+  return scaledDotProductAttention(queries, keys, values, bias).reshaped([
+    batchSize, queryLength, heads * headDim,
+  ])
+}
+
 private func Krea2Attention(
   prefix: (String, String), hiddenSize: Int, heads: Int, keyValueHeads: Int, batchSize: Int,
   tokenLength: Int, rotary: Bool, queryLength: Int? = nil, segments: [Int] = [],
-  usesFlashAttention: FlashAttentionLevel, name: String = ""
+  usesFlashAttention: FlashAttentionLevel, name: String = "", attentionBias: Bool = false
 ) -> (ModelWeightMapper, Model) {
   let x = Input()
   let rot = rotary ? Input() : nil
+  let bias = attentionBias ? Input() : nil
   let queryLength = queryLength ?? tokenLength
   precondition(queryLength <= tokenLength)
   precondition(
@@ -168,6 +267,12 @@ private func Krea2Attention(
     keys = Functional.cmul(left: keys, right: rot)
   }
   let attention: Model.IO
+  if let bias = bias {
+    attention = Krea2BiasedAttention(
+      queries: queries, keys: keys, values: values, bias: bias, batchSize: batchSize,
+      queryLength: queryLength, keyValueLength: tokenLength, heads: heads,
+      keyValueHeads: keyValueHeads, headDim: headDim, usesFlashAttention: usesFlashAttention)
+  } else {
   switch usesFlashAttention {
   case .none:
     if segments.count > 1 {
@@ -266,6 +371,7 @@ private func Krea2Attention(
       ])
     }
   }
+  }
   let gate = toGate(queryIn).sigmoid()
   let toOut = Dense(count: hiddenSize, noBias: true, name: "\(name)to_out")
   let out = toOut(attention .* gate)
@@ -294,6 +400,9 @@ private func Krea2Attention(
     return mapping
   }
   if let rot = rot {
+    if let bias = bias {
+      return (mapper, Model([x, rot, bias], [out]))
+    }
     return (mapper, Model([x, rot], [out]))
   }
   return (mapper, Model([x], [out]))
@@ -425,7 +534,7 @@ public func Krea2TextFusionAdapter(
 
 private func Krea2TransformerBlock(
   batchSize: Int, tokenLength: Int, imageLength: Int, contextBlockPreOnly: Bool,
-  usesFlashAttention: FlashAttentionLevel, prefix: (String, String)
+  usesFlashAttention: FlashAttentionLevel, prefix: (String, String), attentionBias: Bool = false
 ) -> (ModelWeightMapper, Model) {
   precondition(!contextBlockPreOnly || imageLength <= tokenLength)
   let x = Input()
@@ -436,6 +545,7 @@ private func Krea2TransformerBlock(
   let postshiftMod = Input()
   let postgateMod = Input()
   let rot = Input()
+  let bias = attentionBias ? Input() : nil
   let prescaleTable = Parameter<FloatType>(.GPU(0), .CHW(1, 1, 6_144), name: "scale_shift_table_0")
   let preshiftTable = Parameter<FloatType>(.GPU(0), .CHW(1, 1, 6_144), name: "scale_shift_table_1")
   let pregateTable = Parameter<FloatType>(.GPU(0), .CHW(1, 1, 6_144), name: "scale_shift_table_2")
@@ -455,7 +565,7 @@ private func Krea2TransformerBlock(
     batchSize: batchSize,
     tokenLength: tokenLength, rotary: true,
     queryLength: contextBlockPreOnly ? imageLength : tokenLength,
-    usesFlashAttention: usesFlashAttention)
+    usesFlashAttention: usesFlashAttention, attentionBias: attentionBias)
   let xIn: Model.IO =
     contextBlockPreOnly
     ? x.reshaped(
@@ -464,7 +574,7 @@ private func Krea2TransformerBlock(
     ).contiguous() : x
   var out =
     xIn
-    + (pregate .* attention((prescale .* norm1(x).to(.Float16) + preshift), rot)).to(
+    + (pregate .* attention([(prescale .* norm1(x).to(.Float16) + preshift), rot as Model.IO] + (bias.map { [$0 as Model.IO] } ?? []))).to(
       of: xIn)
   let norm2 = RMSNorm(epsilon: 1e-5, axis: [2], name: "norm2")
   let (ffMapper, ff) = Krea2SwiGLU(
@@ -499,7 +609,8 @@ private func Krea2TransformerBlock(
   return (
     mapper,
     Model(
-      [x, prescaleMod, preshiftMod, pregateMod, postscaleMod, postshiftMod, postgateMod, rot],
+      [x, prescaleMod, preshiftMod, pregateMod, postscaleMod, postshiftMod, postgateMod, rot]
+        + (bias.map { [$0] } ?? []),
       [out])
   )
 }
@@ -567,19 +678,53 @@ public func Krea2Fixed(timesteps: Int) -> (ModelWeightMapper, Model) {
 
 public func Krea2(
   batchSize: Int, height: Int, width: Int, textLength: Int,
-  usesFlashAttention: FlashAttentionLevel
+  usesFlashAttention: FlashAttentionLevel, referenceCount: Int = 0, attentionBiasLength: Int = 0
 ) -> (ModelWeightMapper, Model) {
   precondition(height % 2 == 0 && width % 2 == 0)
   let h = height / 2
   let w = width / 2
   let imageLength = h * w
-  let tokenLength = textLength + imageLength
+  let mediaLength = imageLength * (1 + referenceCount)
+  let tokenLength = textLength + mediaLength
   let x = Input()
   let text = Input()
   let rot = Input()
   var inputs: [Input] = [x, text, rot]
-  let packedImage = x.reshaped([batchSize, h, 2, w, 2, 16]).permuted(0, 1, 3, 5, 2, 4)
-    .contiguous().reshaped([batchSize, imageLength, 64])
+  // Krea 2 edit: the reference latents (each the size of the target) are stacked under the
+  // target, so their tokens follow the target's; the rotary tells them apart by frame.
+  let references: Input? = referenceCount > 0 ? Input() : nil
+  let bias: Input? = attentionBiasLength > 0 ? Input() : nil
+  let media: Model.IO
+  if let references = references {
+    let batchedReferences: Model.IO =
+      batchSize > 1 ? Concat(axis: 0)(Array(repeating: references, count: batchSize)) : references
+    media = Functional.concat(axis: 1, x, batchedReferences)
+  } else {
+    media = x
+  }
+  let packedImage = media.reshaped([batchSize, h * (1 + referenceCount), 2, w, 2, 16]).permuted(
+    0, 1, 3, 5, 2, 4
+  )
+  .contiguous().reshaped([batchSize, mediaLength, 64])
+  var blockBias: Model.IO? = nil
+  var lastBlockBias: Model.IO? = nil
+  if let bias = bias {
+    let length = attentionBiasLength
+    var full: Model.IO = bias.reshaped(
+      [1, 1, tokenLength, tokenLength], offset: [0, 0, 0, 0],
+      strides: [length * length, length * length, length, 1]
+    ).contiguous()
+    var last: Model.IO = bias.reshaped(
+      [1, 1, imageLength, tokenLength], offset: [0, 0, 0, 0],
+      strides: [length * length, length * length, length, 1]
+    ).contiguous()
+    if batchSize > 1 {
+      full = Concat(axis: 0)(Array(repeating: full, count: batchSize))
+      last = Concat(axis: 0)(Array(repeating: last, count: batchSize))
+    }
+    blockBias = full
+    lastBlockBias = last
+  }
   let imgIn = Dense(count: 6_144, name: "img_in")
   let imageOut = imgIn(packedImage)
   var out = Functional.concat(axis: 1, imageOut, text).to(.Float32)
@@ -598,15 +743,23 @@ public func Krea2(
     let (mapper, block) = Krea2TransformerBlock(
       batchSize: batchSize, tokenLength: tokenLength, imageLength: imageLength,
       contextBlockPreOnly: i == 27, usesFlashAttention: usesFlashAttention,
-      prefix: ("blocks.\(i)", "transformer_blocks.\(i)"))
-    out = block(
+      prefix: ("blocks.\(i)", "transformer_blocks.\(i)"), attentionBias: bias != nil)
+    let blockInputs: [Model.IO] = [
       out, prescaleMod, preshiftMod, pregateMod, postscaleMod, postshiftMod, postgateMod,
-      rotResized)
+      rotResized,
+    ]
+    out = block(blockInputs + ((i == 27 ? lastBlockBias : blockBias).map { [$0] } ?? []))
     mappers.append(mapper)
   }
   out = out.reshaped([batchSize, imageLength, 6_144]).contiguous()
   let temb = Input()
   inputs.append(temb)
+  if let references = references {
+    inputs.append(references)
+  }
+  if let bias = bias {
+    inputs.append(bias)
+  }
   let finalScaleTable = Parameter<FloatType>(
     .GPU(0), .CHW(1, 1, 6_144), name: "final_scale_shift_table_0")
   let finalShiftTable = Parameter<FloatType>(
@@ -677,11 +830,12 @@ private func LoRAKrea2SwiGLU(
 private func LoRAKrea2Attention(
   prefix: (String, String), hiddenSize: Int, heads: Int, keyValueHeads: Int, batchSize: Int,
   tokenLength: Int, rotary: Bool, queryLength: Int? = nil, segments: [Int] = [],
-  usesFlashAttention: FlashAttentionLevel, name: String = "", layerIndex: Int,
+  usesFlashAttention: FlashAttentionLevel, name: String = "", attentionBias: Bool = false, layerIndex: Int,
   configuration: LoRANetworkConfiguration
 ) -> (ModelWeightMapper, Model) {
   let x = Input()
   let rot = rotary ? Input() : nil
+  let bias = attentionBias ? Input() : nil
   let queryLength = queryLength ?? tokenLength
   precondition(queryLength <= tokenLength)
   precondition(
@@ -738,6 +892,12 @@ private func LoRAKrea2Attention(
     }
   }
   let attention: Model.IO
+  if let bias = bias {
+    attention = Krea2BiasedAttention(
+      queries: queries, keys: keys, values: values, bias: bias, batchSize: batchSize,
+      queryLength: queryLength, keyValueLength: tokenLength, heads: heads,
+      keyValueHeads: keyValueHeads, headDim: headDim, usesFlashAttention: usesFlashAttention)
+  } else {
   switch usesFlashAttention {
   case .none:
     if segments.count > 1 {
@@ -847,6 +1007,7 @@ private func LoRAKrea2Attention(
       ])
     }
   }
+  }
   let gate = toGate(queryIn).sigmoid()
   let toOut = LoRADense(
     count: hiddenSize, configuration: configuration, noBias: true, index: layerIndex,
@@ -877,6 +1038,9 @@ private func LoRAKrea2Attention(
     return mapping
   }
   if let rot = rot {
+    if let bias = bias {
+      return (mapper, Model([x, rot, bias], [out]))
+    }
     return (mapper, Model([x, rot], [out]))
   }
   return (mapper, Model([x], [out]))
@@ -1087,7 +1251,7 @@ public func LoRAKrea2Fixed(
 
 private func LoRAKrea2TransformerBlock(
   batchSize: Int, tokenLength: Int, imageLength: Int, contextBlockPreOnly: Bool,
-  usesFlashAttention: FlashAttentionLevel, prefix: (String, String), layerIndex: Int,
+  usesFlashAttention: FlashAttentionLevel, prefix: (String, String), attentionBias: Bool = false, layerIndex: Int,
   configuration: LoRANetworkConfiguration
 ) -> (ModelWeightMapper, Model) {
   precondition(!contextBlockPreOnly || imageLength <= tokenLength)
@@ -1099,6 +1263,7 @@ private func LoRAKrea2TransformerBlock(
   let postshiftMod = Input()
   let postgateMod = Input()
   let rot = Input()
+  let bias = attentionBias ? Input() : nil
   let prescaleTable = Parameter<FloatType>(.GPU(0), .CHW(1, 1, 6_144), name: "scale_shift_table_0")
   let preshiftTable = Parameter<FloatType>(.GPU(0), .CHW(1, 1, 6_144), name: "scale_shift_table_1")
   let pregateTable = Parameter<FloatType>(.GPU(0), .CHW(1, 1, 6_144), name: "scale_shift_table_2")
@@ -1118,7 +1283,7 @@ private func LoRAKrea2TransformerBlock(
     batchSize: batchSize,
     tokenLength: tokenLength, rotary: true,
     queryLength: contextBlockPreOnly ? imageLength : tokenLength,
-    usesFlashAttention: usesFlashAttention, layerIndex: layerIndex,
+    usesFlashAttention: usesFlashAttention, attentionBias: attentionBias, layerIndex: layerIndex,
     configuration: configuration)
   let xIn: Model.IO =
     contextBlockPreOnly
@@ -1128,7 +1293,7 @@ private func LoRAKrea2TransformerBlock(
     ).contiguous() : x
   var out =
     xIn
-    + (pregate .* attention((prescale .* norm1(x).to(.Float16) + preshift), rot)).to(
+    + (pregate .* attention([(prescale .* norm1(x).to(.Float16) + preshift), rot as Model.IO] + (bias.map { [$0 as Model.IO] } ?? []))).to(
       of: xIn)
   let norm2 = RMSNorm(epsilon: 1e-5, axis: [2], name: "norm2")
   let (ffMapper, ff) = LoRAKrea2SwiGLU(
@@ -1163,26 +1328,62 @@ private func LoRAKrea2TransformerBlock(
   return (
     mapper,
     Model(
-      [x, prescaleMod, preshiftMod, pregateMod, postscaleMod, postshiftMod, postgateMod, rot],
+      [x, prescaleMod, preshiftMod, pregateMod, postscaleMod, postshiftMod, postgateMod, rot]
+        + (bias.map { [$0] } ?? []),
       [out])
   )
 }
 
 public func LoRAKrea2(
   batchSize: Int, height: Int, width: Int, textLength: Int,
-  usesFlashAttention: FlashAttentionLevel, LoRAConfiguration: LoRANetworkConfiguration
+  usesFlashAttention: FlashAttentionLevel, LoRAConfiguration: LoRANetworkConfiguration,
+  referenceCount: Int = 0, attentionBiasLength: Int = 0
 ) -> (ModelWeightMapper, Model) {
   precondition(height % 2 == 0 && width % 2 == 0)
   let h = height / 2
   let w = width / 2
   let imageLength = h * w
-  let tokenLength = textLength + imageLength
+  let mediaLength = imageLength * (1 + referenceCount)
+  let tokenLength = textLength + mediaLength
   let x = Input()
   let text = Input()
   let rot = Input()
   var inputs: [Input] = [x, text, rot]
-  let packedImage = x.reshaped([batchSize, h, 2, w, 2, 16]).permuted(0, 1, 3, 5, 2, 4)
-    .contiguous().reshaped([batchSize, imageLength, 64])
+  // Krea 2 edit: the reference latents (each the size of the target) are stacked under the
+  // target, so their tokens follow the target's; the rotary tells them apart by frame.
+  let references: Input? = referenceCount > 0 ? Input() : nil
+  let bias: Input? = attentionBiasLength > 0 ? Input() : nil
+  let media: Model.IO
+  if let references = references {
+    let batchedReferences: Model.IO =
+      batchSize > 1 ? Concat(axis: 0)(Array(repeating: references, count: batchSize)) : references
+    media = Functional.concat(axis: 1, x, batchedReferences)
+  } else {
+    media = x
+  }
+  let packedImage = media.reshaped([batchSize, h * (1 + referenceCount), 2, w, 2, 16]).permuted(
+    0, 1, 3, 5, 2, 4
+  )
+  .contiguous().reshaped([batchSize, mediaLength, 64])
+  var blockBias: Model.IO? = nil
+  var lastBlockBias: Model.IO? = nil
+  if let bias = bias {
+    let length = attentionBiasLength
+    var full: Model.IO = bias.reshaped(
+      [1, 1, tokenLength, tokenLength], offset: [0, 0, 0, 0],
+      strides: [length * length, length * length, length, 1]
+    ).contiguous()
+    var last: Model.IO = bias.reshaped(
+      [1, 1, imageLength, tokenLength], offset: [0, 0, 0, 0],
+      strides: [length * length, length * length, length, 1]
+    ).contiguous()
+    if batchSize > 1 {
+      full = Concat(axis: 0)(Array(repeating: full, count: batchSize))
+      last = Concat(axis: 0)(Array(repeating: last, count: batchSize))
+    }
+    blockBias = full
+    lastBlockBias = last
+  }
   let imgIn = LoRADense(count: 6_144, configuration: LoRAConfiguration, index: 0, name: "img_in")
   let imageOut = imgIn(packedImage)
   var out = Functional.concat(axis: 1, imageOut, text).to(.Float32)
@@ -1202,16 +1403,25 @@ public func LoRAKrea2(
     let (mapper, block) = LoRAKrea2TransformerBlock(
       batchSize: batchSize, tokenLength: tokenLength, imageLength: imageLength,
       contextBlockPreOnly: i == 27, usesFlashAttention: usesFlashAttention,
-      prefix: ("blocks.\(i)", "transformer_blocks.\(i)"), layerIndex: i,
+      prefix: ("blocks.\(i)", "transformer_blocks.\(i)"), attentionBias: bias != nil,
+      layerIndex: i,
       configuration: LoRAConfiguration)
-    out = block(
+    let blockInputs: [Model.IO] = [
       out, prescaleMod, preshiftMod, pregateMod, postscaleMod, postshiftMod, postgateMod,
-      rotResized)
+      rotResized,
+    ]
+    out = block(blockInputs + ((i == 27 ? lastBlockBias : blockBias).map { [$0] } ?? []))
     mappers.append(mapper)
   }
   out = out.reshaped([batchSize, imageLength, 6_144]).contiguous()
   let temb = Input()
   inputs.append(temb)
+  if let references = references {
+    inputs.append(references)
+  }
+  if let bias = bias {
+    inputs.append(bias)
+  }
   let finalScaleTable = Parameter<FloatType>(
     .GPU(0), .CHW(1, 1, 6_144), name: "final_scale_shift_table_0")
   let finalShiftTable = Parameter<FloatType>(
