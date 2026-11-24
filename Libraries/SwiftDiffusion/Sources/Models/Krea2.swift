@@ -183,8 +183,32 @@ private func Krea2ExplicitAttention(
 private func Krea2BoostedAttention(
   queries: Model.IO, keys: Model.IO, values: Model.IO, batchSize: Int, queryLength: Int,
   tokenLength: Int, targetLength: Int, referenceRepeats: [Int], heads: Int, keyValueHeads: Int,
-  headDim: Int
+  headDim: Int, usesFlashAttention: FlashAttentionLevel
 ) -> Model.IO {
+  // Same attention kernels as the regular path. In particular .scale1 pre-scales the queries
+  // and runs the kernel at scale 1: passing the scale to the kernel instead overflows Float16
+  // on Krea 2's large query/key norms (NaN at the last steps).
+  func attend(_ q: Model.IO, _ k: Model.IO, _ v: Model.IO, queryLength: Int, keyValueLength: Int)
+    -> Model.IO
+  {
+    switch usesFlashAttention {
+    case .none:
+      return Krea2ExplicitAttention(
+        queries: q, keys: k, values: v, batchSize: batchSize, queryLength: queryLength,
+        keyValueLength: keyValueLength, heads: heads, keyValueHeads: keyValueHeads,
+        headDim: headDim)
+    case .scale1:
+      let sdpa = ScaledDotProductAttention(scale: 1, flags: [.Float16])
+      return sdpa((1.0 / Float(headDim).squareRoot()) * q, k, v).reshaped([
+        batchSize, queryLength, heads * headDim,
+      ])
+    case .scaleMerged, .quantized:
+      let sdpa = ScaledDotProductAttention(
+        scale: 1.0 / Float(headDim).squareRoot(), useHadamard: true,
+        flags: usesFlashAttention == .quantized ? [.Int8] : [.Float16])
+      return sdpa(q, k, v).reshaped([batchSize, queryLength, heads * headDim])
+    }
+  }
   func slice(_ t: Model.IO, start: Int, length: Int, total: Int, heads: Int) -> Model.IO {
     t.reshaped(
       [batchSize, length, heads, headDim], offset: [0, start, 0, 0],
@@ -221,23 +245,21 @@ private func Krea2BoostedAttention(
   let targetQueries =
     queryLength == targetLength
     ? queries : slice(queries, start: 0, length: targetLength, total: queryLength, heads: heads)
-  let targetAttention = ScaledDotProductAttention(
-    scale: 1.0 / Float(headDim).squareRoot(), flags: [.Float16])
+  let boostedLength = targetLength * (1 + referenceRepeats.reduce(0) { $0 + max($1, 1) })
+    + (tokenLength - offset)
   var outs = [
-    targetAttention(targetQueries, boostedKeys, boostedValues).reshaped([
-      batchSize, targetLength, heads * headDim,
-    ])
+    attend(
+      targetQueries, boostedKeys, boostedValues, queryLength: targetLength,
+      keyValueLength: boostedLength)
   ]
   if queryLength > targetLength {
     let restQueries = slice(
       queries, start: targetLength, length: queryLength - targetLength, total: queryLength,
       heads: heads)
-    let restAttention = ScaledDotProductAttention(
-      scale: 1.0 / Float(headDim).squareRoot(), flags: [.Float16])
     outs.append(
-      restAttention(restQueries, keys, values).reshaped([
-        batchSize, queryLength - targetLength, heads * headDim,
-      ]))
+      attend(
+        restQueries, keys, values, queryLength: queryLength - targetLength,
+        keyValueLength: tokenLength))
   }
   guard outs.count > 1 else { return outs[0] }
   let concat = Concat(axis: 1)
@@ -292,7 +314,7 @@ private func Krea2Attention(
       queries: queries, keys: keys, values: values, batchSize: batchSize,
       queryLength: queryLength, tokenLength: tokenLength, targetLength: targetLength,
       referenceRepeats: referenceRepeats, heads: heads, keyValueHeads: keyValueHeads,
-      headDim: headDim)
+      headDim: headDim, usesFlashAttention: usesFlashAttention)
   } else {
   switch usesFlashAttention {
   case .none:
@@ -890,7 +912,7 @@ private func LoRAKrea2Attention(
       queries: queries, keys: keys, values: values, batchSize: batchSize,
       queryLength: queryLength, tokenLength: tokenLength, targetLength: targetLength,
       referenceRepeats: referenceRepeats, heads: heads, keyValueHeads: keyValueHeads,
-      headDim: headDim)
+      headDim: headDim, usesFlashAttention: usesFlashAttention)
   } else {
   switch usesFlashAttention {
   case .none:
