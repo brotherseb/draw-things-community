@@ -603,7 +603,7 @@ struct GenerateImageInputOptions: ParsableArguments {
   @Option(
     name: .customLong("krea2-ref-boost"),
     help:
-      "Krea 2 edit: reference-fidelity dial for the last reference (the subject): multiplies the target-to-reference attention. 1 = off.")
+      "Krea 2 edit: reference-fidelity dial for the last reference (the subject): multiplies the target-to-reference attention weight, in whole numbers (rounded). 1 = off; 3 to 4 recommended.")
   var krea2RefBoost: Float = 1
 
   @Option(

@@ -1954,14 +1954,14 @@ extension UNetFromNNC {
         unet = ModelBuilderOrModel.modelBuilder(
           ModelBuilder { _, inputs in
             let textShape = inputs[1].shape
-            // Krea 2 edit: inputs[10] holds the stacked reference latents, inputs[11] the
-            // attention bias (see UNetFixedEncoder).
+            // Krea 2 edit: inputs[10] holds the stacked reference latents (see UNetFixedEncoder).
             return LoRAKrea2(
               batchSize: inputs[0].shape[0], height: tiledHeight, width: tiledWidth,
               textLength: textShape[1], usesFlashAttention: valueOr(useFlashAttention, .scale1),
               LoRAConfiguration: configuration,
               referenceCount: inputs.count > 10 ? inputs[10].shape[1] / tiledHeight : 0,
-              attentionBiasLength: inputs.count > 11 ? inputs[11].shape[3] : 0
+              referenceRepeats: Krea2EditReferenceRepeats(
+                referenceCount: inputs.count > 10 ? inputs[10].shape[1] / tiledHeight : 0)
             ).1
           })
       } else {
@@ -1972,7 +1972,8 @@ extension UNetFromNNC {
               batchSize: inputs[0].shape[0], height: tiledHeight, width: tiledWidth,
               textLength: textShape[1], usesFlashAttention: valueOr(useFlashAttention, .scale1),
               referenceCount: inputs.count > 10 ? inputs[10].shape[1] / tiledHeight : 0,
-              attentionBiasLength: inputs.count > 11 ? inputs[11].shape[3] : 0
+              referenceRepeats: Krea2EditReferenceRepeats(
+                referenceCount: inputs.count > 10 ? inputs[10].shape[1] / tiledHeight : 0)
             ).1
           })
       }

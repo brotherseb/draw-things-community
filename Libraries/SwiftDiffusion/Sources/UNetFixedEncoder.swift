@@ -784,7 +784,7 @@ extension UNetFixedEncoder {
       let maxTextLength = isCfgEnabled ? max(tokenLengthUncond, tokenLengthCond) : tokenLengthCond
       precondition(fixedConditions.count == 1 + 6 + 1)
       // Krea 2 edit (fork prototype): reference latents, each brought to the target latent size,
-      // stacked under the target; RoPE frames 1...N; optional target-to-reference attention bias.
+      // stacked under the target; RoPE frames 1...N (the boost is applied in the attention).
       if !referenceImages.isEmpty, let edit = Krea2EditSettings.fromEnvironment() {
         let references = referenceImages.map { reference -> DynamicGraph.Tensor<FloatType> in
           let shape = reference.shape
@@ -809,18 +809,11 @@ extension UNetFixedEncoder {
             textLength: maxTextLength, gridHeight: h, gridWidth: w, references: positions,
             of: FloatType.self
           ).toGPU(0))
-        let boosts = edit.referenceBoosts(count: references.count)
-        var outputs: [DynamicGraph.AnyTensor] =
+        let repeats = Krea2EditReferenceRepeats(referenceCount: references.count)
+        let outputs: [DynamicGraph.AnyTensor] =
           [fixedConditions[0], rotary] + Array(fixedConditions[1...]) + [stacked]
-        if boosts.contains(where: { $0 != 1 }) {
-          outputs.append(
-            graph.variable(
-              Krea2EditAttentionBias(
-                imageLength: h * w, boosts: boosts, textLength: maxTextLength, of: FloatType.self
-              ).toGPU(0)))
-        }
         print(
-          "Krea 2 edit: \(references.count) reference(s), boost \(boosts), positions \(positions.map { $0.xOffset == 0 ? "aligned" : "beside" })"
+          "Krea 2 edit: \(references.count) reference(s), boost (whole repeats) \(repeats), positions \(positions.map { $0.xOffset == 0 ? "aligned" : "beside" })"
         )
         return (outputs, nil)
       }
