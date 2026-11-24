@@ -5331,13 +5331,6 @@ extension LocalImageGenerator {
         secondPassModelVersion = modelVersion
         secondPassModelFilePath = ModelZoo.filePathForModelDownloaded(file)
       }
-      // LTX-2.3 IC-LoRA: the guide (pose video) only conditions the first pass, so its LoRA is left
-      // out of the second pass, where it would only cost time.
-      let hasLTXGuide =
-        modelVersion == .ltx2_3
-        && (poses.first.map { $0.0.shape.count == 4 && $0.0.shape[0] > 1 } ?? false)
-      let secondPassLoRA =
-        hasLTXGuide ? lora.filter { !$0.file.lowercased().contains("ic_lora") } : lora
       let secondPassSampler = LocalImageGenerator.sampler(
         from: configuration.sampler, isCfgEnabled: isCfgEnabled,
         filePath: secondPassModelFilePath, modifier: modifier,
@@ -5357,7 +5350,7 @@ extension LocalImageGenerator {
         externalOnDemand: externalOnDemand,
         injectControls: canInjectControls, injectT2IAdapters: canInjectT2IAdapters,
         injectAttentionKV: canInjectAttentionKVs,
-        injectIPAdapterLengths: injectIPAdapterLengths, lora: secondPassLoRA,
+        injectIPAdapterLengths: injectIPAdapterLengths, lora: lora,
         isGuidanceEmbedEnabled: isGuidanceEmbedEnabled, isQuantizedModel: isQuantizedModel,
         canRunLoRASeparately: canRunLoRASeparately,
         stochasticSamplingGamma: configuration.stochasticSamplingGamma,
