@@ -667,6 +667,15 @@ struct GenerateOutputOptions: ParsableArguments {
   @Option(name: .long, help: videoFormatHelp)
   var videoFormat: VideoExportFormat?
 
+  @Flag(
+    name: .long,
+    help: ArgumentHelp(
+      "Rename the output with the generation details and its duration.",
+      discussion:
+        "With --output folder/label.png, writes folder/YYYYMMDD-HHMM_label_<model>[_lora-<name><weight>]_<width>x<height>[_<frames>f]_<steps>et_seed<seed>_<duration>.png, where the duration includes model loading (for example 2m17, or 1h05m03)."
+    ))
+  var stamp: Bool = false
+
   @Flag(name: .long, help: terminalImageHelp)
   var terminalImage: Bool = false
 
@@ -3154,6 +3163,71 @@ private func authenticateCloudRequest(
   )
 }
 
+/// Renames written outputs as YYYYMMDD-HHMM_label_<model>[_lora-<name><weight>]_<W>x<H>[_<frames>f]
+/// _<steps>et_seed<seed>_<duration>.<ext> in the same folder (--stamp). The date is the start of the
+/// generation and the duration includes model loading. A file that cannot be moved keeps its name.
+private func stampedOutputPaths(
+  _ paths: [String], configuration: GenerationConfiguration, totalDuration: TimeInterval
+) -> [String] {
+  let formatter = DateFormatter()
+  formatter.locale = Locale(identifier: "en_US_POSIX")
+  formatter.dateFormat = "yyyyMMdd-HHmm"
+  let start = formatter.string(from: Date().addingTimeInterval(-totalDuration))
+  func stem(_ file: String) -> String {
+    var name = (file as NSString).lastPathComponent
+    for suffix in [".ckpt", ".safetensors"] where name.hasSuffix(suffix) {
+      name.removeLast(suffix.count)
+    }
+    for suffix in ["_lora_f16", "_lora"] where name.hasSuffix(suffix) {
+      name.removeLast(suffix.count)
+    }
+    return name
+  }
+  var details = [String]()
+  if let model = configuration.model {
+    details.append(stem(model))
+  }
+  for lora in configuration.loras {
+    guard let file = lora.file else { continue }
+    details.append("lora-\(stem(file))\(String(format: "%g", lora.weight))")
+  }
+  details.append(
+    "\(Int(configuration.startWidth) * 64)x\(Int(configuration.startHeight) * 64)")
+  let seconds = max(0, Int(totalDuration.rounded()))
+  let duration =
+    seconds >= 3600
+    ? String(format: "%dh%02dm%02d", seconds / 3600, (seconds % 3600) / 60, seconds % 60)
+    : String(format: "%dm%02d", seconds / 60, seconds % 60)
+  var renamed = [String]()
+  for (index, path) in paths.enumerated() {
+    let url = URL(fileURLWithPath: path)
+    let fileExtension = url.pathExtension
+    let label = url.deletingPathExtension().lastPathComponent
+    var parts = [start, label] + details
+    if ["mp4", "mov"].contains(fileExtension.lowercased()) && configuration.numFrames > 1 {
+      parts.append("\(configuration.numFrames)f")
+    }
+    parts.append("\(configuration.steps)et")
+    parts.append("seed\(configuration.seed)")
+    parts.append(duration)
+    if paths.count > 1 {
+      parts.append("\(index + 1)")
+    }
+    var name = parts.joined(separator: "_")
+    if !fileExtension.isEmpty {
+      name += "." + fileExtension
+    }
+    let destination = url.deletingLastPathComponent().appendingPathComponent(name).path
+    do {
+      try FileManager.default.moveItem(atPath: path, toPath: destination)
+      renamed.append(destination)
+    } catch {
+      renamed.append(path)
+    }
+  }
+  return renamed
+}
+
 private func formatDurationForCLI(_ duration: TimeInterval) -> String {
   if duration < 1 {
     return "\(Int((duration * 1000).rounded())) ms"
@@ -4577,6 +4651,9 @@ extension DrawThingsCLI {
           .disabled
         }
       try validateVideoOutputOptions(outputPath: outputPath, videoFormat: output.videoFormat)
+      if output.stamp && !writesOutputFile {
+        throw ValidationError("--stamp needs --output: it renames the written file.")
+      }
       try TerminalImageRenderer.validateRequestedOutput(
         context: context, outputPath: outputPath, mode: terminalImageMode,
         protocolChoice: output.terminalImageProtocol,
@@ -4809,13 +4886,19 @@ extension DrawThingsCLI {
             }
           }
         }
+        let writtenPaths =
+          writesOutputFile && output.stamp
+          ? stampedOutputPaths(
+            result.outputPaths, configuration: configuration,
+            totalDuration: result.timing.totalGenerationDuration)
+          : result.outputPaths
         if writesOutputFile {
-          for path in result.outputPaths {
+          for path in writtenPaths {
             context.print("Wrote: \(path)")
           }
         }
         TerminalImageRenderer.renderGeneratedOutputsIfRequested(
-          context: context, result.outputPaths,
+          context: context, writtenPaths,
           mode: terminalImageMode,
           protocolChoice: output.terminalImageProtocol
         )
@@ -4987,14 +5070,20 @@ extension DrawThingsCLI {
           }
         }
       }
+      let writtenPaths =
+        writesOutputFile && output.stamp
+        ? stampedOutputPaths(
+          result.outputPaths, configuration: configuration,
+          totalDuration: result.timing.totalGenerationDuration)
+        : result.outputPaths
       if writesOutputFile {
-        for path in result.outputPaths {
+        for path in writtenPaths {
           context.print("Wrote: \(path)")
         }
       }
       if !renderedFinalImageInPlace {
         TerminalImageRenderer.renderGeneratedOutputsIfRequested(
-          context: context, result.outputPaths, mode: terminalImageMode,
+          context: context, writtenPaths, mode: terminalImageMode,
           protocolChoice: output.terminalImageProtocol)
       }
       printGenerationTimingSummary(context: context, result.timing)
