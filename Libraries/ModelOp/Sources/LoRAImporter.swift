@@ -1305,19 +1305,20 @@ public enum LoRAImporter {
 
   public static func `import`(
     downloadedFile: String, name: String, filename: String, scaleFactor: Double,
-    forceVersion: ModelVersion?, progress: (Float) -> Void
+    forceVersion: ModelVersion?, lokrRank: Int = LoKrConverter.defaultRank,
+    progress: (Float) -> Void
   ) throws -> (ModelVersion, Bool, Int, Bool) {
     let filePath =
       downloadedFile.starts(with: "/")
       ? downloadedFile : ModelZoo.filePathForDownloadedFile(downloadedFile)
-    let archive: TensorArchive
+    let fileArchive: TensorArchive
     var stateDict: [String: TensorDescriptor]
     if let safeTensors = SafeTensors(url: URL(fileURLWithPath: filePath)) {
-      archive = safeTensors
+      fileArchive = safeTensors
       let states = safeTensors.states
       stateDict = states
     } else if let zipArchive = Archive(url: URL(fileURLWithPath: filePath), accessMode: .read) {
-      archive = zipArchive
+      fileArchive = zipArchive
       let rootObject = try Interpreter.unpickle(zip: zipArchive)
       let originalStateDict = rootObject["state_dict"] as? Interpreter.Dictionary ?? rootObject
       stateDict = [String: TensorDescriptor]()
@@ -1328,6 +1329,9 @@ public enum LoRAImporter {
     } else {
       throw UnpickleError.dataNotFound
     }
+    // LoKr modules become PEFT-style lora_A / lora_B pairs, read through an overlay archive.
+    let archive = try LoKrConverter.convert(
+      stateDict: &stateDict, archive: fileArchive, rank: lokrRank)
     let keys = stateDict.keys
     func copyAlphaIfPresent(
       from oldKey: String, stripping suffix: String, alpha: String, to newKey: String

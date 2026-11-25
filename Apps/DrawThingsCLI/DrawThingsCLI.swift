@@ -6662,6 +6662,13 @@ extension DrawThingsCLI {
     @Option(name: .long, help: "Output file name in the models directory.")
     var output: String
 
+    @Option(
+      name: .customLong("lokr-rank"),
+      help:
+        "LoKr adapters only: rank of the LoRA each module is converted to. The share of the update kept is printed; raise the rank if it is low."
+    )
+    var lokrRank: Int = ModelOp.LoKrConverter.defaultRank
+
     mutating func run(context: DrawThingsCLIContext) throws {
       let modelsDirectory = try ModelsDirectoryResolver.resolve(
         context: context, path: modelsDirectoryOptions.modelsDir)
@@ -6676,7 +6683,10 @@ extension DrawThingsCLI {
       let path = URL(fileURLWithPath: context.path(file)).standardizedFileURL.path
       let (importedVersion, _, _, _) = try ModelOp.LoRAImporter.import(
         downloadedFile: path, name: output, filename: output, scaleFactor: 1,
-        forceVersion: modelVersion, progress: { _ in })
+        forceVersion: modelVersion, lokrRank: lokrRank, progress: { _ in })
+      if let report = ModelOp.LoKrConverter.lastReport {
+        context.print(report)
+      }
       let outputPath = ModelZoo.filePathForModelDownloaded(output)
       context.print(
         "Converted \(path) as \(importedVersion.rawValue) to \(outputPath) (exists: \(FileManager.default.fileExists(atPath: outputPath)))"
