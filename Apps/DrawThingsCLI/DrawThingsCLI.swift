@@ -6777,7 +6777,7 @@ extension DrawThingsCLI {
               for name in names {
                 guard
                   let original = baseStore.read(
-                    name, kind: .CPU, codec: [.q6p, .q8p, .ezm7, .externalData])
+                    name, kind: .CPU, codec: [.q6p, .q8p, .i8x, .ezm7, .externalData])
                 else {
                   skipped.append(name)
                   continue
