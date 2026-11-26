@@ -641,6 +641,12 @@ struct GenerateImageInputOptions: ParsableArguments {
   var controlVideo: String?
 
   @Option(
+    name: .customLong("second-pass-model"),
+    help:
+      "LTX-2 / LTX-2.3: model file for the second pass (hires fix), for example the plain distilled checkpoint when the first pass runs on a checkpoint with a merged IC-LoRA. Same model family as --model; needs hiresFix.")
+  var secondPassModel: String?
+
+  @Option(
     name: .customLong("control-downscale"),
     help:
       "Reference downscale factor of the IC-LoRA: the guide is encoded at the first-pass size divided by this (2 for the ...-ref0.5 LoRAs).")
@@ -4984,6 +4990,31 @@ extension DrawThingsCLI {
       }
       defer {
         Krea2EditSettings.current = nil
+      }
+      if let secondPassModel = imageInput.secondPassModel {
+        let version = modelSpecification.version
+        guard version == .ltx2 || version == .ltx2_3 else {
+          throw ValidationError("--second-pass-model needs an LTX-2 or LTX-2.3 model.")
+        }
+        guard ModelZoo.versionForModel(secondPassModel) == version else {
+          throw ValidationError(
+            "--second-pass-model \(secondPassModel) is not a \(version) model (or is not in the models directory).")
+        }
+        guard ModelZoo.isModelDownloaded(secondPassModel) else {
+          throw ValidationError("--second-pass-model \(secondPassModel) is not in the models directory.")
+        }
+        if !configuration.hiresFix {
+          context.write(
+            "Warning: --second-pass-model without hiresFix: there is no second pass, the option has no effect.\n",
+            to: .standardError)
+        }
+        LTXSecondPassSettings.modelFile = secondPassModel
+        context.print("Second pass model: \(secondPassModel)")
+      } else {
+        LTXSecondPassSettings.modelFile = nil
+      }
+      defer {
+        LTXSecondPassSettings.modelFile = nil
       }
       // Prototype plumbing: read by FirstStage for LTX models.
       if let depth = imageInput.ltxDecodeDepth {

@@ -2,6 +2,17 @@ import DiffusionMappings
 import Foundation
 import NNC
 
+/// LTX-2 / LTX-2.3 second pass (hires fix with the latent upscaler) on another checkpoint than the
+/// first pass, as the reference ComfyUI workflows do: an IC-LoRA (pose guide, pixel upscaler) merged
+/// into the first-pass checkpoint cannot be left out of the second pass otherwise, and the guide only
+/// conditions the first pass. Set by the CLI for one generation (--second-pass-model); a
+/// process-wide value rather than a configuration field, because the generation configuration is a
+/// FlatBuffers schema whose new fields belong to the maintainers. nil: same checkpoint for both passes.
+public enum LTXSecondPassSettings {
+  /// Model file (in the models directory) for the second pass, or nil.
+  public static var modelFile: String? = nil
+}
+
 public func LTX2RotaryPositionEmbedding1D(
   tokenLength: Int, maxLength: Int, channels: Int, headDimension: Int
 )

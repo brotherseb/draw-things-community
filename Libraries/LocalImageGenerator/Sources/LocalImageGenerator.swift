@@ -5327,6 +5327,13 @@ extension LocalImageGenerator {
         secondPassModelVersion = .wurstchenStageB
         secondPassModelFilePath = ModelZoo.filePathForModelDownloaded(
           ModelZoo.stageModelsForModel(file)[0])
+      } else if modelVersion == .ltx2 || modelVersion == .ltx2_3,
+        let secondPassFile = LTXSecondPassSettings.modelFile,
+        ModelZoo.versionForModel(secondPassFile) == modelVersion
+      {
+        // LTX: second pass on another checkpoint (for example without a merged IC-LoRA).
+        secondPassModelVersion = modelVersion
+        secondPassModelFilePath = ModelZoo.filePathForModelDownloaded(secondPassFile)
       } else {
         secondPassModelVersion = modelVersion
         secondPassModelFilePath = ModelZoo.filePathForModelDownloaded(file)
