@@ -5379,9 +5379,20 @@ extension LocalImageGenerator {
         secondPassSampling = Sampling(
           steps: Int(configuration.stage2Steps), shift: Double(configuration.stage2Shift))
       } else {
-        startStep = (
-          integral: initTimestep.roundedDownStartStep, fractional: initTimestep.startStep
-        )
+        // LTX manual second pass schedule: start from its first sigma, as the reference workflows do.
+        let manualSecondPassSampling: Sampling? =
+          (modelVersion == .ltx2 || modelVersion == .ltx2_3)
+          ? LTXSigmasSettings.secondPass.map {
+            Sampling(steps: $0.count - 1, shift: sampling.shift)
+          } : nil
+        if manualSecondPassSampling != nil {
+          LTXSigmasSettings.isSecondPass = true
+          startStep = (integral: 0, fractional: 0)
+        } else {
+          startStep = (
+            integral: initTimestep.roundedDownStartStep, fractional: initTimestep.startStep
+          )
+        }
         let channels: Int
         switch modelVersion {
         case .minimaxH3, .minimaxH3Image:
@@ -5430,15 +5441,15 @@ extension LocalImageGenerator {
           of: FloatType.self)
         noise.randn(std: 1, mean: 0)
         let sampleScaleFactor = secondPassSampler.sampleScaleFactor(
-          at: initTimestep.startStep, sampling: sampling)
+          at: startStep.fractional, sampling: manualSecondPassSampling ?? sampling)
         let noiseScaleFactor = secondPassSampler.noiseScaleFactor(
-          at: initTimestep.startStep, sampling: sampling)
+          at: startStep.fractional, sampling: manualSecondPassSampling ?? sampling)
         xEnc = sampleAdd(
           sample, noise: noise, scale: (sample: sampleScaleFactor, noise: noiseScaleFactor),
           version: modelVersion,
           audioShiftRatio: Float(Double(configuration.shiftForAudio) / sampling.shift))
         secondPassTextGuidance = textGuidanceScale
-        secondPassSampling = sampling
+        secondPassSampling = manualSecondPassSampling ?? sampling
       }
       if modelVersion == .v2 || modelVersion == .sdxlBase || modelVersion == .sdxlRefiner
         || modelVersion == .ssd1b || modelVersion == .svdI2v || modelVersion == .wurstchenStageC
@@ -5506,11 +5517,12 @@ extension LocalImageGenerator {
       }
       guard
         feedback(
-          .secondPassSampling(secondPassSampling.steps - initTimestep.roundedDownStartStep),
+          .secondPassSampling(secondPassSampling.steps - startStep.integral),
           signposts, nil)
       else {
         return (nil, nil, 1)
       }
+      LTXSigmasSettings.isSecondPass = false
       x = applyImageCond(
         x, modifier: modifier, version: modelVersion, imageCond: secondPassImageCond)
       x = withLTXAudio(x, audioHeight: audioHeight)

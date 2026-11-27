@@ -647,6 +647,18 @@ struct GenerateImageInputOptions: ParsableArguments {
   var secondPassModel: String?
 
   @Option(
+    name: .customLong("sigmas"),
+    help:
+      "LTX-2 / LTX-2.3: manual sigma schedule of the generation (first pass with hires fix), comma-separated from the highest down to 0, one more value than --steps. E.g. the distilled schedule of the reference workflows: 1.0,0.99375,0.9875,0.98125,0.975,0.909375,0.725,0.421875,0.0")
+  var sigmas: String?
+
+  @Option(
+    name: .customLong("second-pass-sigmas"),
+    help:
+      "LTX-2 / LTX-2.3: manual sigma schedule of the hires fix second pass, comma-separated from the highest down to 0; the second pass then starts from the first value (instead of hiresFixStrength). E.g. 0.85,0.7250,0.4219,0.0")
+  var secondPassSigmas: String?
+
+  @Option(
     name: .customLong("control-downscale"),
     help:
       "Reference downscale factor of the IC-LoRA: the guide is encoded at the first-pass size divided by this (2 for the ...-ref0.5 LoRAs).")
@@ -5018,6 +5030,56 @@ extension DrawThingsCLI {
       }
       defer {
         LTXSecondPassSettings.modelFile = nil
+      }
+      func parseSigmas(_ text: String, _ option: String) throws -> [Double] {
+        let values = text.split(separator: ",").map {
+          Double($0.trimmingCharacters(in: .whitespaces))
+        }
+        guard values.count >= 2, values.allSatisfy({ $0 != nil }) else {
+          throw ValidationError("\(option) must be comma-separated numbers, at least two.")
+        }
+        let sigmas = values.compactMap { $0 }
+        guard sigmas.last == 0, sigmas.allSatisfy({ $0 >= 0 && $0 <= 1 }),
+          zip(sigmas, sigmas.dropFirst()).allSatisfy({ $0 > $1 })
+        else {
+          throw ValidationError(
+            "\(option) must decrease strictly from at most 1 down to 0 (last value 0).")
+        }
+        return sigmas
+      }
+      LTXSigmasSettings.firstPass = nil
+      LTXSigmasSettings.secondPass = nil
+      LTXSigmasSettings.isSecondPass = false
+      defer {
+        LTXSigmasSettings.firstPass = nil
+        LTXSigmasSettings.secondPass = nil
+        LTXSigmasSettings.isSecondPass = false
+      }
+      if imageInput.sigmas != nil || imageInput.secondPassSigmas != nil {
+        let version = modelSpecification.version
+        guard version == .ltx2 || version == .ltx2_3 else {
+          throw ValidationError("--sigmas and --second-pass-sigmas need an LTX-2 or LTX-2.3 model.")
+        }
+      }
+      if let text = imageInput.sigmas {
+        let sigmas = try parseSigmas(text, "--sigmas")
+        guard sigmas.count - 1 == Int(configuration.steps) else {
+          throw ValidationError(
+            "--sigmas has \(sigmas.count - 1) steps but --steps is \(configuration.steps): give one more value than the steps.")
+        }
+        LTXSigmasSettings.firstPass = sigmas
+        context.print("Sigmas: \(sigmas.map { String($0) }.joined(separator: ", "))")
+      }
+      if let text = imageInput.secondPassSigmas {
+        let sigmas = try parseSigmas(text, "--second-pass-sigmas")
+        if !configuration.hiresFix {
+          context.write(
+            "Warning: --second-pass-sigmas without hiresFix: there is no second pass, the option has no effect.\n",
+            to: .standardError)
+        }
+        LTXSigmasSettings.secondPass = sigmas
+        context.print(
+          "Second pass sigmas: \(sigmas.map { String($0) }.joined(separator: ", "))")
       }
       // Prototype plumbing: read by FirstStage for LTX models.
       if let depth = imageInput.ltxDecodeDepth {

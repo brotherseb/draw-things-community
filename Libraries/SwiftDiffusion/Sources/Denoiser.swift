@@ -449,6 +449,9 @@ extension Denoiser {
       if let EDMDiscretization = EDMDiscretization {
         return EDMDiscretization.alphasCumprod(steps: steps, shift: shift)
       } else if let RFParameterization = RFParameterization {
+        if let manual = LTXSigmasSettings.rfAlphasCumprod(steps: steps) {
+          return manual
+        }
         var fixedStepAlphasCumprod = [Double]()
         for i in 0..<steps {
           let timestep: Double

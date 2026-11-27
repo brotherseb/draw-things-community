@@ -13,6 +13,27 @@ public enum LTXSecondPassSettings {
   public static var modelFile: String? = nil
 }
 
+/// LTX-2 / LTX-2.3 manual sigma schedules, as the reference ComfyUI workflows set them (ManualSigmas):
+/// the distilled checkpoint is trained for its own schedule, which the shift-based schedules do not
+/// reproduce. `firstPass` replaces the schedule of a generation with `count - 1` steps; `secondPass`
+/// replaces the hires fix second pass, which then starts from its first sigma instead of the hires fix
+/// strength. Each list goes from the highest sigma down to 0. Set by the CLI for one generation
+/// (--sigmas, --second-pass-sigmas); nil: the usual schedule.
+public enum LTXSigmasSettings {
+  public static var firstPass: [Double]? = nil
+  public static var secondPass: [Double]? = nil
+  /// True while the second pass samples (set by the generator).
+  public static var isSecondPass = false
+
+  /// Alphas cumprod of the active manual schedule for a rectified flow model, or nil.
+  static func rfAlphasCumprod(steps: Int) -> [Double]? {
+    guard let sigmas = isSecondPass ? secondPass : firstPass, sigmas.count == steps + 1 else {
+      return nil
+    }
+    return sigmas.dropLast().map { 1 - $0 } + [1.0]
+  }
+}
+
 public func LTX2RotaryPositionEmbedding1D(
   tokenLength: Int, maxLength: Int, channels: Int, headDimension: Int
 )
