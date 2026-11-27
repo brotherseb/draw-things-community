@@ -4637,9 +4637,7 @@ extension DrawThingsCLI {
         throw ValidationError("--audio currently supports only local generation.")
       }
       if imageInput.video != nil {
-        if imageInput.audio != nil {
-          throw ValidationError("--video cannot be combined with --audio.")
-        }
+        // H3 Ref2VA takes a reference clip and a reference audio together (<Video 1>, <Audio 1>).
         if backend.cloudCompute {
           throw ValidationError(
             "--video supports local generation and --remote servers, not Cloud Compute yet.")
@@ -4952,8 +4950,25 @@ extension DrawThingsCLI {
         let audioInput = try AudioInput(
           contentsOf: audioPath,
           sampleRate: ModelZoo.audioSampleRateForModel(configuration.model ?? ""))
-        context.print("Loading audio: \(audioPath)")
-        audio = audioInput.waveform
+        if modelSpecification.version == .minimaxH3 {
+          // H3 takes the stretch of the song the clip covers, from --audio-start-time, as LTX does.
+          let duration = Double(videoFrames) / Double(fps)
+          guard
+            let segment = LTX2AudioEncoding.segment(
+              audioInput.waveform,
+              sampleRate: ModelZoo.audioSampleRateForModel(configuration.model ?? ""),
+              startTime: imageInput.audioStartTime, duration: duration)
+          else {
+            throw ValidationError("--audio-start-time is past the end of \(audioPath).")
+          }
+          context.print(
+            "Loading audio: \(audioPath) (from \(imageInput.audioStartTime) s, \(String(format: "%.2f", duration)) s)"
+          )
+          audio = segment
+        } else {
+          context.print("Loading audio: \(audioPath)")
+          audio = audioInput.waveform
+        }
         if modelSpecification.version == .longcatVideoAvatar1_5 {
           // LongCat outputs silent video; H3 generates its own audio from the reference.
           fallbackAudio = audioInput.waveformTensor(
