@@ -3778,8 +3778,14 @@ extension LocalImageGenerator {
           height = startHeight * 16
           width = startWidth * 16
         } else {
-          let scale = min(
-            1, sqrt(Double(startHeight * startWidth * 256) / Double(shape[1] * shape[2])))
+          // A reference clip is encoded 17 frames at a time at full size: from 768x1280 the video
+          // encoder's activations pass 2^31 elements and the graph fails to build (assertion in
+          // ccv_nnc_tensor_symbol_alias_new, from MiniMaxH3VideoEncoder). Cap a clip at 576x960 worth
+          // of pixels, which builds; pictures keep the output area.
+          let maxPixels =
+            frames > 1 ? min(Double(startHeight * startWidth * 256), 552_960) : Double(
+              startHeight * startWidth * 256)
+          let scale = min(1, sqrt(maxPixels / Double(shape[1] * shape[2])))
           height = max(32, Int((Double(shape[1]) * scale / 32).rounded()) * 32)
           width = max(32, Int((Double(shape[2]) * scale / 32).rounded()) * 32)
         }
