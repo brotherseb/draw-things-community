@@ -4737,17 +4737,20 @@ extension DrawThingsCLI {
       }
       // The generator drops a LoRA whose version is not the model's without a word, which looks
       // like a LoRA with no effect: most often a local LoRA neither registered in custom_lora.json
-      // nor given a version here (its version then defaults to SD 1.x).
+      // nor given a version here (its version then defaults to SD 1.x). Stop before loading the
+      // model rather than generate (and --stamp) an image without the LoRAs that were asked for.
       if configuration.refinerModel == nil {
         for file in configuration.loras.compactMap({ $0.file }) {
           if LoRAZoo.specificationForModel(file) == nil {
-            context.write(
-              "Warning: LoRA \(file) is not registered in custom_lora.json and has no version in --config-json loras, so it will be ignored. Add \"version\": \"\(modelSpecification.version.rawValue)\" to its entry.\n",
-              to: .standardError)
-          } else if LoRAZoo.versionForModel(file) != modelSpecification.version {
-            context.write(
-              "Warning: LoRA \(file) is for \(LoRAZoo.versionForModel(file).rawValue), not \(modelSpecification.version.rawValue), so it will be ignored.\n",
-              to: .standardError)
+            throw ValidationError(
+              "LoRA \(file) is not registered in custom_lora.json and has no version in --config-json loras, so it would be ignored. Add \"version\": \"\(modelSpecification.version.rawValue)\" to its entry, or register it once with import-lora --version \(modelSpecification.version.rawValue)."
+            )
+          } else if LoRAZoo.versionForModel(file) != modelSpecification.version,
+            !(modelSpecification.version == .kandinsky21 && LoRAZoo.versionForModel(file) == .v1)
+          {
+            throw ValidationError(
+              "LoRA \(file) is for \(LoRAZoo.versionForModel(file).rawValue), not \(modelSpecification.version.rawValue), so it would be ignored."
+            )
           }
         }
       }
@@ -6764,7 +6767,8 @@ private func parseWeightsMemoryValue(_ value: Any?) throws -> LoRATrainer.Weight
 extension DrawThingsCLI {
   /// Converts a LoRA with an explicit model version, for LoRAs whose family the importer cannot
   /// detect (an LTX-2.3 IC-LoRA has no audio weights and is detected as PixArt). The converted file
-  /// is not registered in custom_lora.json: pass its version in --config-json loras[].version.
+  /// is registered in custom_lora.json with that version, as the app does when it imports a LoRA,
+  /// so `generate` uses it without a version in --config-json loras.
   struct ImportLoRA: DrawThingsCLICommand {
     static let configuration = CommandConfiguration(
       commandName: "import-lora",
@@ -6801,15 +6805,24 @@ extension DrawThingsCLI {
         return modelVersion
       }
       let path = URL(fileURLWithPath: context.path(file)).standardizedFileURL.path
-      let (importedVersion, _, _, _) = try ModelOp.LoRAImporter.import(
+      let (importedVersion, _, _, isLoHa) = try ModelOp.LoRAImporter.import(
         downloadedFile: path, name: output, filename: output, scaleFactor: 1,
         forceVersion: modelVersion, lokrRank: lokrRank, progress: { _ in })
+      // Without this entry, generate ignored the LoRA (its version defaulted to SD 1.x).
+      var displayName = (output as NSString).lastPathComponent
+      for suffix in [".ckpt", "_lora_f16", "_lora"] where displayName.hasSuffix(suffix) {
+        displayName.removeLast(suffix.count)
+      }
+      LoRAZoo.appendCustomSpecification(
+        LoRAZoo.Specification(
+          name: displayName, file: output, prefix: "", version: importedVersion,
+          isLoHa: isLoHa ? true : nil))
       if let report = ModelOp.LoKrConverter.lastReport {
         context.print(report)
       }
       let outputPath = ModelZoo.filePathForModelDownloaded(output)
       context.print(
-        "Converted \(path) as \(importedVersion.rawValue) to \(outputPath) (exists: \(FileManager.default.fileExists(atPath: outputPath)))"
+        "Converted \(path) as \(importedVersion.rawValue) to \(outputPath) (exists: \(FileManager.default.fileExists(atPath: outputPath))), registered in custom_lora.json"
       )
     }
   }
