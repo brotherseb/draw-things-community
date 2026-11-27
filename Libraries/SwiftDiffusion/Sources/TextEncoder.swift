@@ -71,12 +71,23 @@ extension TextEncoder {
       let configuration = Qwen3_5VisionConfiguration(
         hiddenSize: 1_152, intermediateSize: 4_304, outputHiddenSize: 5_120, layers: 27)
       var imagePatches = [DynamicGraph.Tensor<Float>]()
+      // Ref2VA with a reference clip shows the vision tower its frames, in pairs, next to the
+      // pictures, each at its own size: at 768x1280, 9 frames and a picture come to ~6,000 vision
+      // tokens and the generation fails at the start (assertion in ccv_nnc_tensor_symbol_alias_new),
+      // while 576x960 (~3,300) works. Scale every image down together to a total of 3,276,800 pixels
+      // (one vision token per 32x32 pixels, ~3,200 tokens). The vision tower only reads them to
+      // understand the references; the autoencoder still encodes them at full size.
+      let ref2vaPixelBudget = 3_276_800.0
+      let totalPixels = images.reduce(0.0) { $0 + Double($1.shape[1] * $1.shape[2]) }
+      let budgetScale =
+        modifier == .ref2va && version != .minimaxH3Image && totalPixels > ref2vaPixelBudget
+        ? (ref2vaPixelBudget / totalPixels).squareRoot() : 1
       for image in images {
         // H3 uses Qwen3-VL's image resize policy, not the Qwen3.5 chat token budget.
         let height = image.shape[1]
         let width = image.shape[2]
-        var sourceHeight = Double(height)
-        var sourceWidth = Double(width)
+        var sourceHeight = Double(height) * budgetScale
+        var sourceWidth = Double(width) * budgetScale
         let maxPixels: Double
         if version == .minimaxH3Image {
           // H3 Image first scales each reference to a 1024-pixel short edge, in multiples of 32.
